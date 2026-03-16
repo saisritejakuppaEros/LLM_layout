@@ -31,11 +31,12 @@ from stage2.resolvers.position_resolver import resolve_positions
 from stage2.resolvers.collision      import resolve_collisions
 from stage2.resolvers.bounds         import clamp_bounds
 from stage2.resolvers.occlusion      import resolve_occlusions
-from stage2.utils.diagram            import render_front_view, compute_bboxes_from_placements
+from stage2.utils.diagram            import render_front_view, render_birds_eye_view, compute_bboxes_from_placements
 from stage2.validators.question_generator import generate_questions
 from stage2.validators.question_evaluator import evaluate_questions
 from stage2.validators.delta_generator    import generate_deltas
 from stage2.validators.delta_applicator   import apply_deltas
+from stage2.validators.layout_vlm_consistency import try_relational_resolve
 
 
 def _extract_priorities(graph) -> dict[str, str]:
@@ -135,7 +136,9 @@ def run_stage2(scene_data: dict, scene_id: str) -> dict:
     q_result = None
     for iteration in range(MAX_VLM_ITERATIONS):
         diagram_path = os.path.join(iterations_dir, f"diagram_iter{iteration}.png")
+        birds_eye_path = os.path.join(iterations_dir, f"birds_eye_iter{iteration}.png")
         render_front_view(placements, scene_data, diagram_path)
+        render_birds_eye_view(placements, scene_data, birds_eye_path)
 
         object_bboxes_px = compute_bboxes_from_placements(placements, diagram_path)
 
@@ -143,6 +146,7 @@ def run_stage2(scene_data: dict, scene_id: str) -> dict:
             f"=== Iteration {iteration + 1}/{MAX_VLM_ITERATIONS} ===",
             "",
             f"Diagram: {diagram_path}",
+            f"Bird's-eye: {birds_eye_path}",
             f"Placements: {len(placements)} objects",
             "",
             "--- Questions ---",
@@ -152,7 +156,7 @@ def run_stage2(scene_data: dict, scene_id: str) -> dict:
         debug_lines.append("")
 
         _log(f"[{scene_id}] Pass 2: Evaluating questions — iteration {iteration + 1}/{MAX_VLM_ITERATIONS}...")
-        q_result = evaluate_questions(diagram_path, questions)
+        q_result = evaluate_questions(diagram_path, questions, placements, birds_eye_path=birds_eye_path)
 
         debug_lines.extend([
             "--- Q Validation Result ---",
@@ -198,7 +202,7 @@ def run_stage2(scene_data: dict, scene_id: str) -> dict:
             _write_debug_log(os.path.join(iterations_dir, f"debug_iter{iteration}.txt"), debug_lines)
             continue
 
-        # Pass 3: Generate deltas for failed questions (only those with object_ids)
+        # Pass 3: Try LayoutVLM relational re-solve first; fallback to deltas
         failed_questions = [q for q in questions if q.id in q_result.failed_question_ids]
         failed_with_objects = [q for q in failed_questions if q.object_ids]
         debug_lines.append("--- Failed Questions ---")
@@ -206,32 +210,55 @@ def run_stage2(scene_data: dict, scene_id: str) -> dict:
             debug_lines.append(f"  {q.id}: {q.text}")
         debug_lines.append("")
 
-        _log(f"[{scene_id}] Pass 3: Generating deltas for {len(failed_questions)} failed questions...")
-        delta_result = generate_deltas(
+        layout_dict = _placements_to_dict(placements)
+        placements_before = layout_dict.copy()
+        relational_ok, modified_graph = try_relational_resolve(
             diagram_path,
+            birds_eye_path,
+            layout_dict,
+            graph,
             failed_with_objects if failed_with_objects else failed_questions,
-            object_bboxes_px,
-            placements,
         )
 
-        with open(os.path.join(iterations_dir, f"delta_result_iter{iteration}.json"), "w") as f:
-            json.dump({"deltas": {k: {"dx": v[0], "dy": v[1], "dz": v[2]} for k, v in delta_result.deltas.items()}}, f, indent=2)
+        if relational_ok and modified_graph is not None:
+            _log(f"[{scene_id}] Pass 3: LayoutVLM relational re-solve succeeded, re-running resolver...")
+            graph = modified_graph
+            placements = resolve_positions(graph)
+            placements = resolve_collisions(placements, priorities)
+            placements = clamp_bounds(placements)
+            placements = resolve_occlusions(placements)
+            debug_lines.extend([
+                "--- Decision ---",
+                "LayoutVLM relational re-solve: applied corrections, re-ran resolver.",
+            ])
+        else:
+            _log(f"[{scene_id}] Pass 3: LayoutVLM fallback — generating deltas for {len(failed_questions)} failed questions...")
+            delta_result = generate_deltas(
+                diagram_path,
+                failed_with_objects if failed_with_objects else failed_questions,
+                object_bboxes_px,
+                placements,
+            )
 
-        debug_lines.append("--- Deltas Applied ---")
-        for obj_id, (dx, dy, dz) in delta_result.deltas.items():
-            debug_lines.append(f"  {obj_id}: dx={dx:.4f} dy={dy:.4f} dz={dz:.4f}")
-        debug_lines.append("")
+            with open(os.path.join(iterations_dir, f"delta_result_iter{iteration}.json"), "w") as f:
+                json.dump({"deltas": {k: {"dx": v[0], "dy": v[1], "dz": v[2]} for k, v in delta_result.deltas.items()}}, f, indent=2)
 
-        placements_before = _placements_to_dict(placements)
-        placements = apply_deltas(placements, delta_result.deltas)
-        placements = resolve_collisions(placements, priorities)
-        placements = clamp_bounds(placements)
-        placements = resolve_occlusions(placements)
+            debug_lines.append("--- Deltas Applied ---")
+            for obj_id, (dx, dy, dz) in delta_result.deltas.items():
+                debug_lines.append(f"  {obj_id}: dx={dx:.4f} dy={dy:.4f} dz={dz:.4f}")
+            debug_lines.append("")
+
+            placements = apply_deltas(placements, delta_result.deltas)
+            placements = resolve_collisions(placements, priorities)
+            placements = clamp_bounds(placements)
+            placements = resolve_occlusions(placements)
+            debug_lines.extend([
+                "--- Decision ---",
+                "Not approved. Applying deltas, then collision + bounds + occlusion.",
+            ])
+
         placements_after = _placements_to_dict(placements)
-
         debug_lines.extend([
-            "--- Decision ---",
-            "Not approved. Applying deltas, then collision + bounds + occlusion.",
             "",
             "--- Placements changed ---",
         ])
@@ -261,8 +288,8 @@ def run_stage2(scene_data: dict, scene_id: str) -> dict:
         f"Q-based validation approved: {q_result.approved if q_result else False}",
         f"Iterations dir: {iterations_dir}",
         "",
-        "Files: questions.json, questions.txt, run_log.txt, layout.json, diagram_final.png",
-        "Per-iteration: diagram_iter{N}.png, debug_iter{N}.txt, question_result_iter{N}.json, delta_result_iter{N}.json",
+        "Files: questions.json, questions.txt, run_log.txt, layout.json, diagram_final.png, birds_eye_final.png",
+        "Per-iteration: diagram_iter{N}.png, birds_eye_iter{N}.png, debug_iter{N}.txt, question_result_iter{N}.json, delta_result_iter{N}.json",
     ]
     _write_debug_log(os.path.join(scene_out_dir, "debug_run_summary.txt"), summary_lines)
     with open(final_layout_path, "w") as f:
@@ -275,9 +302,11 @@ def run_stage2(scene_data: dict, scene_id: str) -> dict:
             "q_approved":  q_result.approved if q_result else False,
         }, f, indent=2)
 
-    # final diagram
+    # final diagrams
     final_diagram = os.path.join(scene_out_dir, "diagram_final.png")
+    final_birds_eye = os.path.join(scene_out_dir, "birds_eye_final.png")
     render_front_view(placements, scene_data, final_diagram)
+    render_birds_eye_view(placements, scene_data, final_birds_eye)
 
     _log(f"[{scene_id}] Done → {final_layout_path}")
     return final_layout

@@ -102,34 +102,62 @@ def _fix_invalid_refs_with_llm(invalid: list[dict], layout_objects: set[str]) ->
     return result
 
 
+def _enforce_depth_coherence(relations: list[dict], layout_objects: set[str]) -> None:
+    """
+    Ensure child.layer == parent.layer for surface=on:<parent>.
+    Child must be in same depth band as parent.
+    """
+    obj_to_rel = {r["object"]: r for r in relations}
+    layout_normalized = {_normalize_name(o): o for o in layout_objects}
+
+    for rel in relations:
+        surface = rel.get("surface") or "floor"
+        if not surface.startswith("on:"):
+            continue
+
+        parent_ref = surface[3:].strip()
+        parent_canonical = layout_normalized.get(_normalize_name(parent_ref))
+        if not parent_canonical or parent_canonical not in obj_to_rel:
+            continue
+
+        parent_rel = obj_to_rel[parent_canonical]
+        child_layer = rel.get("layer", "midground")
+        parent_layer = parent_rel.get("layer", "midground")
+
+        if child_layer != parent_layer:
+            rel["layer"] = parent_layer
+
+
 def validate_parent_existence(graph: SceneGraph) -> SceneGraph:
     """
     Validate every on:<x> reference exists in the layout.
     Invalid refs are fixed via LLM (demote to floor or map to valid parent).
+    Add depth coherence: child.layer = parent.layer for on:<parent>.
     """
     relations = [r.copy() for r in graph.relations]
     layout_objects = _get_layout_objects(relations)
     invalid = _find_invalid_on_refs(relations, layout_objects)
 
-    if not invalid:
-        return graph
+    if invalid:
+        for inv in invalid:
+            print(f"  [parent_check] {inv['object']}: surface={inv['surface']} — parent '{inv['parent_ref']}' not in layout, fixing via LLM...")
 
-    for inv in invalid:
-        print(f"  [parent_check] {inv['object']}: surface={inv['surface']} — parent '{inv['parent_ref']}' not in layout, fixing via LLM...")
+        fixes = _fix_invalid_refs_with_llm(invalid, layout_objects)
+        fix_by_object = {f["object"]: f["surface"] for f in fixes if isinstance(f, dict) and "object" in f and "surface" in f}
 
-    fixes = _fix_invalid_refs_with_llm(invalid, layout_objects)
-    fix_by_object = {f["object"]: f["surface"] for f in fixes if isinstance(f, dict) and "object" in f and "surface" in f}
+        for inv in invalid:
+            if inv["object"] not in fix_by_object:
+                fix_by_object[inv["object"]] = "floor"
 
-    for inv in invalid:
-        if inv["object"] not in fix_by_object:
-            fix_by_object[inv["object"]] = "floor"
+        for rel in relations:
+            obj_name = rel.get("object")
+            if obj_name in fix_by_object:
+                new_surface = fix_by_object[obj_name]
+                if new_surface in ("floor", "wall", "ceiling", "floating") or new_surface.startswith("on:"):
+                    rel["surface"] = new_surface
 
-    for rel in relations:
-        obj_name = rel.get("object")
-        if obj_name in fix_by_object:
-            new_surface = fix_by_object[obj_name]
-            if new_surface in ("floor", "wall", "ceiling", "floating") or new_surface.startswith("on:"):
-                rel["surface"] = new_surface
+    # Depth coherence: child must match parent layer
+    _enforce_depth_coherence(relations, layout_objects)
 
     return SceneGraph(
         scene_type=graph.scene_type,

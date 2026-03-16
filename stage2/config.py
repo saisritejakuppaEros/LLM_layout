@@ -31,5 +31,19 @@ DIOU_COLLISION_THRESH = 0.10
 # Environment geometry: objects with w or d > this are tagged, exempt from collision/bounds
 ENV_GEOMETRY_THRESHOLD = 3.0
 
+# Zone budget for Phase A placement (X distribution)
+ZONE_NAMES = ["left", "center-left", "center", "center-right", "right"]
+ZONE_X = {
+    "left":         -SCENE_WIDTH * 0.4,
+    "center-left":  -SCENE_WIDTH * 0.2,
+    "center":       0.0,
+    "center-right":  SCENE_WIDTH * 0.2,
+    "right":         SCENE_WIDTH * 0.4,
+}
+ZONE_BUDGET = 3  # max objects per zone
+
+# LayoutVLM consistency
+LAYOUT_VLM_CONSISTENCY_THRESH = 0.8
+
 # output
 OUTPUT_DIR = os.getenv("STAGE2_OUT", "/mnt/data0/teja/research_multiref/llm_based_layout/outputs/stage2")

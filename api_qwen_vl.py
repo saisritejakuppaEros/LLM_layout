@@ -24,6 +24,7 @@ print("VL Model Loaded")
 
 class Request(BaseModel):
     image_url: str | None = None
+    image_urls: list[str] | None = None
     image_base64: str | None = None
     prompt: str = "Describe this image."
     max_tokens: int = 512
@@ -31,20 +32,25 @@ class Request(BaseModel):
 
 @app.post("/generate")
 def generate(req: Request):
-    if req.image_base64:
+    content = []
+
+    if req.image_urls and len(req.image_urls) > 0:
+        for url in req.image_urls:
+            content.append({"type": "image", "image": url})
+    elif req.image_base64:
         image_input = f"data:image/png;base64,{req.image_base64}"
+        content.append({"type": "image", "image": image_input})
     elif req.image_url:
-        image_input = req.image_url
+        content.append({"type": "image", "image": req.image_url})
     else:
-        raise HTTPException(422, "Either image_url or image_base64 must be provided")
+        raise HTTPException(422, "Either image_url, image_urls, or image_base64 must be provided")
+
+    content.append({"type": "text", "text": req.prompt})
 
     messages = [
         {
             "role": "user",
-            "content": [
-                {"type": "image", "image": image_input},
-                {"type": "text", "text": req.prompt},
-            ],
+            "content": content,
         }
     ]
 

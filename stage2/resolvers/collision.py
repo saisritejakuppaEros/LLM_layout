@@ -10,7 +10,10 @@ from stage2.config import DIOU_COLLISION_THRESH, DEPTH_BANDS, SCENE_WIDTH
 from stage2.utils.types import ObjectPlacement, ObjectSize
 
 
-PRIORITY_MAP = {"primary": 3, "secondary": 2, "tertiary": 1}
+# Resolution order: earlier = higher priority = moved last
+# env_geometry is always skipped (never moved)
+RESOLUTION_ORDER = ["primary", "secondary", "tertiary"]
+PRIORITY_MAP = {"primary": 0, "secondary": 1, "tertiary": 2}
 
 
 def _bbox(p: ObjectPlacement) -> tuple[float, float, float, float, float, float]:
@@ -112,11 +115,11 @@ def resolve_collisions(
                 score = diou3d(a, b)
                 if score > DIOU_COLLISION_THRESH:
                     collision_found = True
-                    pri_a = PRIORITY_MAP.get(priorities.get(a.name, "tertiary"), 1)
-                    pri_b = PRIORITY_MAP.get(priorities.get(b.name, "tertiary"), 1)
+                    pri_a = PRIORITY_MAP.get(priorities.get(a.name, "tertiary"), 2)
+                    pri_b = PRIORITY_MAP.get(priorities.get(b.name, "tertiary"), 2)
 
-                    # move the lower-priority object
-                    if pri_a >= pri_b:
+                    # move the lower-priority object (higher index in RESOLUTION_ORDER)
+                    if pri_a < pri_b:
                         _push_apart(b, a)
                     else:
                         _push_apart(a, b)

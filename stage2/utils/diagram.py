@@ -11,7 +11,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
-from stage2.config import SCENE_WIDTH, SCENE_HEIGHT
+from stage2.config import SCENE_WIDTH, SCENE_HEIGHT, SCENE_DEPTH
 from stage2.utils.types import ObjectPlacement, ObjectSize
 
 LAYER_COLORS = {
@@ -27,6 +27,16 @@ def _name_to_short(name: str, max_len: int = 8) -> str:
     if len(name) <= max_len:
         return name
     return name[: max_len - 1] + "."
+
+
+def get_name_to_box_id(placements: dict) -> dict[str, int]:
+    """Same ordering as diagram legend. Returns {name: box_number}."""
+    layer_order = ["background", "midground", "foreground"]
+    ordered = sorted(
+        placements.values(),
+        key=lambda p: (layer_order.index(p.layer) if p.layer in layer_order else 0, -p.z)
+    )
+    return {p.name: i + 1 for i, p in enumerate(ordered)}
 
 
 def render_front_view(
@@ -117,6 +127,111 @@ def render_front_view(
             family="monospace")
 
     # Layer legend (compact)
+    legend_elements = [
+        patches.Patch(facecolor=LAYER_COLORS["foreground"], label="FG", alpha=0.8),
+        patches.Patch(facecolor=LAYER_COLORS["midground"],  label="MG", alpha=0.8),
+        patches.Patch(facecolor=LAYER_COLORS["background"], label="BG", alpha=0.8),
+        patches.Patch(facecolor=WALL_COLOR, label="Wall", alpha=0.8),
+    ]
+    ax.legend(handles=legend_elements, loc="upper right", fontsize=7,
+              facecolor="#222", edgecolor="#555", labelcolor="white", ncol=2)
+
+    plt.subplots_adjust(bottom=0.12)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+
+    return output_path
+
+
+def render_birds_eye_view(
+    placements: dict[str, ObjectPlacement],
+    scene_data: dict,
+    output_path: str,
+) -> str:
+    """
+    Render bird's-eye view (XZ plane): X horizontal, Z vertical.
+    Camera at top (Z=0), back wall at bottom (Z=SCENE_DEPTH).
+    Each object = rectangle (x ± w/2, z ± d/2).
+    """
+    fig, ax = plt.subplots(figsize=(12, 10))
+    half_w = SCENE_WIDTH / 2.0
+    ax.set_xlim(-half_w, half_w)
+    ax.set_ylim(SCENE_DEPTH, 0)
+    ax.set_aspect("equal")
+    ax.set_facecolor("#1a1a2e")
+    fig.patch.set_facecolor("#0f0f1a")
+
+    ax.set_xlabel("X (left ← → right)", color="white", fontsize=9)
+    ax.set_ylabel("Z (camera → back)", color="white", fontsize=9)
+    ax.tick_params(colors="white", labelsize=8)
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#444")
+
+    title = scene_data.get("theme", "Scene Layout")
+    ax.set_title(f"Bird's-Eye View (XZ) — {title}", color="white", fontsize=12, pad=10)
+
+    layer_order = ["background", "midground", "foreground"]
+    ordered = sorted(
+        placements.values(),
+        key=lambda p: (layer_order.index(p.layer) if p.layer in layer_order else 0, -p.z),
+    )
+    name_to_id = {p.name: i + 1 for i, p in enumerate(ordered)}
+
+    for p in ordered:
+        s = p.size or ObjectSize(0.3, 0.4, 0.3)
+        color = WALL_COLOR if p.surface == "wall" else LAYER_COLORS.get(p.layer, "#aaa")
+        alpha = 0.45 if p.layer == "background" else 0.7 if p.layer == "midground" else 0.95
+        lw = 1.0 if p.layer == "background" else 1.5 if p.layer == "midground" else 2.0
+
+        x_min = p.x - s.w / 2
+        z_min = p.z - s.d / 2
+        y_plot = SCENE_DEPTH - (p.z + s.d / 2)
+        height_plot = s.d
+
+        rect = patches.FancyBboxPatch(
+            (x_min, y_plot),
+            s.w, height_plot,
+            boxstyle="round,pad=0.02",
+            linewidth=lw,
+            edgecolor="white",
+            facecolor=color,
+            alpha=alpha,
+        )
+        ax.add_patch(rect)
+
+        obj_id = name_to_id[p.name]
+        ax.text(
+            x_min + 0.08,
+            y_plot + height_plot - 0.08,
+            str(obj_id),
+            ha="left", va="top",
+            fontsize=8, color="white",
+            fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.15", facecolor="black", alpha=0.7, edgecolor="white", linewidth=0.5),
+        )
+
+        short = _name_to_short(p.name)
+        ax.text(
+            p.x, y_plot - 0.08,
+            short,
+            ha="center", va="top",
+            fontsize=6, color="white",
+        )
+
+    legend_items = [f"{name_to_id[p.name]}: {p.name}" for p in ordered]
+    n_per_line = 5
+    lines = []
+    for i in range(0, len(legend_items), n_per_line):
+        lines.append("  |  ".join(legend_items[i : i + n_per_line]))
+    legend_text = "\n".join(lines)
+    n_lines = len(lines)
+    bottom_offset = 0.04 + 0.025 * n_lines
+    ax.text(0.5, -bottom_offset, legend_text, transform=ax.transAxes,
+            ha="center", va="top", fontsize=6, color="#aaa",
+            family="monospace")
+
     legend_elements = [
         patches.Patch(facecolor=LAYER_COLORS["foreground"], label="FG", alpha=0.8),
         patches.Patch(facecolor=LAYER_COLORS["midground"],  label="MG", alpha=0.8),

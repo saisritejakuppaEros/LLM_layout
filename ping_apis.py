@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Sample script to ping the text and vision APIs."""
 
+import base64
 import requests
 
 TEXT_API = "http://localhost:8001/generate"
 VL_API = "http://localhost:8002/generate"
-LOCAL_IMAGE = "/mnt/data0/teja/research_multiref/InstanceAssemble/fig/teaser.jpg"
+IMAGE_API = "http://localhost:8004/generate"
+LOCAL_IMAGE = "/mnt/data0/harsha/synthetic_dataset_gen/bucket_samples/02_clothing_textiles/02_clothing_textiles_08.jpg"
+IMAGE_EDIT_TEST_IMAGE = "/mnt/data0/harsha/synthetic_dataset_gen/bucket_samples/02_clothing_textiles/02_clothing_textiles_04.jpg"
 
 
 def ping_text_api():
@@ -60,11 +63,47 @@ def ping_vl_api():
         return False
 
 
+def ping_image_api():
+    """Ping the image edit API (image path + prompt)."""
+    print("=" * 50)
+    print("Pinging Image Edit API (port 8004)...")
+    print("=" * 50)
+    try:
+        resp = requests.post(
+            IMAGE_API,
+            json={
+                "prompt": "a realistic image of a man wearing a red nehru jacket, preserve the fabric texture",
+                "image_path": IMAGE_EDIT_TEST_IMAGE,
+                "negative_prompt": "blurry, low quality, distorted, texture change, fabric distortion",
+                "num_inference_steps": 50,
+                "width": 1536,
+                "height": 1024,
+                "true_cfg_scale": 4.0,
+                "seed": 42,
+            },
+            timeout=180,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        image_b64 = data.get("response", "")
+        out_path = "image_edit_output.png"
+        with open(out_path, "wb") as f:
+            f.write(base64.b64decode(image_b64))
+        print(f"Response: base64 image ({len(image_b64)} chars)")
+        print(f"Saved to {out_path}\n")
+        return True
+    except requests.exceptions.ConnectionError:
+        print("ERROR: Could not connect. Is the image API running on port 8004?\n")
+        return False
+    except Exception as e:
+        print(f"ERROR: {e}\n")
+        return False
+
+
 if __name__ == "__main__":
     print("\nPinging Qwen APIs...\n")
-    t = ping_text_api()
-    v = ping_vl_api()
+    # t = ping_text_api()
+    # v = ping_vl_api()
+    i = ping_image_api()
     print("=" * 50)
-    print(f"Text API: {'OK' if t else 'FAILED'}")
-    print(f"Vision API: {'OK' if v else 'FAILED'}")
     print("=" * 50)

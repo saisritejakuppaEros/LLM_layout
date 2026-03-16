@@ -5,6 +5,8 @@ import re
 import requests
 from stage2.config import TEXT_API, VL_API
 
+SYSTEM_PREFIX = "You are a strict scene layout validator. Respond ONLY with valid JSON. No preamble, no explanation.\n\n"
+
 
 def call_llm(prompt: str, max_tokens: int = 2048) -> str:
     resp = requests.post(
@@ -16,12 +18,21 @@ def call_llm(prompt: str, max_tokens: int = 2048) -> str:
     return resp.json()["response"]
 
 
-def call_vlm(image_path: str, prompt: str, max_tokens: int = 1024) -> str:
-    resp = requests.post(
-        VL_API,
-        json={"image_url": image_path, "prompt": prompt, "max_tokens": max_tokens},
-        timeout=120,
-    )
+def call_vlm(
+    image_path: str | None = None,
+    image_paths: list[str] | None = None,
+    prompt: str = "",
+    max_tokens: int = 1024,
+) -> str:
+    """Call VLM with one or more images. Prefer image_paths for multi-image."""
+    if image_paths and len(image_paths) > 0:
+        payload = {"image_urls": image_paths, "prompt": SYSTEM_PREFIX + prompt, "max_tokens": max_tokens}
+    elif image_path:
+        payload = {"image_url": image_path, "prompt": SYSTEM_PREFIX + prompt, "max_tokens": max_tokens}
+    else:
+        raise ValueError("Either image_path or image_paths must be provided")
+
+    resp = requests.post(VL_API, json=payload, timeout=120)
     resp.raise_for_status()
     return resp.json()["response"]
 
