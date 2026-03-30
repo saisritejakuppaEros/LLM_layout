@@ -1,5 +1,6 @@
 """Validation using real training batches: flow-matching loss to TensorBoard, cond-aware sampling to disk.
 
+By default, canvas conditioning matches training-time augmentation (see ``--validation_canvas_augment``).
 Metrics are always appended to ``{output_dir}/validation_metrics.jsonl`` so you still get scalars if the
 ``tensorboard`` package is missing (Accelerate then has no TB tracker and ``accelerator.log`` is a no-op).
 """
@@ -255,15 +256,28 @@ def run_dataloader_validation(
     if args.seed is not None:
         g.manual_seed(int(args.seed) + int(global_step))
 
-    val_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=n,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=0,
-        generator=g,
+    # Match training-time canvas augments in saved PNGs unless --no-validation_canvas_augment.
+    want_clean = hasattr(train_dataset, "_canvas_augment_enabled") and not getattr(
+        args, "validation_canvas_augment", True
     )
-    batch = next(iter(val_loader))
+    if want_clean:
+        _saved_canvas_aug = train_dataset._canvas_augment_enabled
+        train_dataset._canvas_augment_enabled = False
+    else:
+        _saved_canvas_aug = None
+    try:
+        val_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=n,
+            shuffle=True,
+            collate_fn=collate_fn,
+            num_workers=0,
+            generator=g,
+        )
+        batch = next(iter(val_loader))
+    finally:
+        if _saved_canvas_aug is not None:
+            train_dataset._canvas_augment_enabled = _saved_canvas_aug
     device = accelerator.device
 
     was_training = transformer.training

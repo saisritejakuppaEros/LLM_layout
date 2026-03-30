@@ -187,6 +187,7 @@ def _build_canvas_args(ns: argparse.Namespace) -> SimpleNamespace:
         validation_num_samples=ns.validation_num_samples,
         validation_inference_steps=ns.validation_inference_steps,
         validation_samples_subdir=ns.validation_samples_subdir,
+        validation_canvas_augment=getattr(ns, "validation_canvas_augment", True),
         seed=ns.seed,
         output_dir=str(ns.run_root / "validation_out"),
         # unused but present on real train Namespace

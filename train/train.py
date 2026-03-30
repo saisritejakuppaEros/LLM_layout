@@ -272,6 +272,142 @@ def parse_args(input_args=None):
         help="bbox_multiview: canvas base (black, or full frame letterboxed under crops — same layout as bbox mapping).",
     )
     parser.add_argument(
+        "--canvas_geom_extreme_max_crops",
+        type=int,
+        default=3,
+        help=(
+            "bbox_multiview: per image, at most this many bbox crops get strong perspective + two-axis shear; "
+            "all other crops still paste with mild shear (legacy single-axis). Brightness aug is unchanged. "
+            "0 = all crops mild geometry."
+        ),
+    )
+    parser.add_argument(
+        "--canvas_augment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "bbox_multiview: train-time augmentations on canvas — bbox expand/shrink (margin), bimodal brightness "
+            "(very dim vs heavily lit on full scene + per-crop), perspective + strong two-axis shear on crops. "
+            "Validation snapshots follow training augments by default (--validation_canvas_augment); use "
+            "--no-validation_canvas_augment for clean canvas PNGs. 720p: set --unified_train_width 1280 "
+            "--unified_train_height 720 so compose matches unified box."
+        ),
+    )
+    parser.add_argument(
+        "--canvas_augment_bbox_margin_prob",
+        type=float,
+        default=1.0,
+        help="bbox_multiview: when canvas_augment, probability per box to apply margin expand/shrink.",
+    )
+    parser.add_argument(
+        "--canvas_augment_bbox_margin_min",
+        type=int,
+        default=10,
+        help="bbox_multiview: margin min (pixels in source image space).",
+    )
+    parser.add_argument(
+        "--canvas_augment_bbox_margin_max",
+        type=int,
+        default=30,
+        help="bbox_multiview: margin max (pixels in source image space).",
+    )
+    parser.add_argument(
+        "--canvas_augment_bbox_expand_prob",
+        type=float,
+        default=0.5,
+        help="bbox_multiview: probability to expand vs shrink the box (when margin is applied).",
+    )
+    parser.add_argument(
+        "--canvas_augment_brightness_prob",
+        type=float,
+        default=0.88,
+        help="bbox_multiview: per-crop probability for brightness jitter (bimodal dim vs lit by default).",
+    )
+    parser.add_argument(
+        "--canvas_augment_brightness_bimodal",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "bbox_multiview: sample brightness in two bands (dim vs heavily lit). If disabled, uniform in "
+            "[--canvas_augment_brightness_min, --canvas_augment_brightness_max]."
+        ),
+    )
+    parser.add_argument(
+        "--canvas_augment_brightness_min",
+        type=float,
+        default=0.45,
+        help="bbox_multiview: brightness lower bound when bimodal is off (uniform mode).",
+    )
+    parser.add_argument(
+        "--canvas_augment_brightness_max",
+        type=float,
+        default=1.85,
+        help="bbox_multiview: brightness upper bound when bimodal is off (uniform mode).",
+    )
+    parser.add_argument(
+        "--canvas_augment_brightness_dim_min",
+        type=float,
+        default=0.32,
+        help="bbox_multiview: bimodal — very dim crops/scene lower factor (PIL ImageEnhance.Brightness).",
+    )
+    parser.add_argument(
+        "--canvas_augment_brightness_dim_max",
+        type=float,
+        default=0.58,
+        help="bbox_multiview: bimodal — very dim upper factor.",
+    )
+    parser.add_argument(
+        "--canvas_augment_brightness_lit_min",
+        type=float,
+        default=1.42,
+        help="bbox_multiview: bimodal — heavily lit lower factor.",
+    )
+    parser.add_argument(
+        "--canvas_augment_brightness_lit_max",
+        type=float,
+        default=2.08,
+        help="bbox_multiview: bimodal — heavily lit upper factor.",
+    )
+    parser.add_argument(
+        "--canvas_augment_global_brightness_prob",
+        type=float,
+        default=0.88,
+        help=(
+            "bbox_multiview: probability to apply one global brightness (same dim/lit sampling) to the full frame "
+            "before crops — keeps target image and source crops in the same lighting."
+        ),
+    )
+    parser.add_argument(
+        "--canvas_augment_perspective_prob",
+        type=float,
+        default=0.48,
+        help=(
+            "bbox_multiview: per-crop probability for random perspective (trapezoid / keystone-style warp, "
+            "torchvision RandomPerspective-style corner sampling)."
+        ),
+    )
+    parser.add_argument(
+        "--canvas_augment_perspective_distortion",
+        type=float,
+        default=0.62,
+        help=(
+            "bbox_multiview: perspective strength in [0, 1], same meaning as torchvision RandomPerspective "
+            "distortion_scale (higher = more extreme corners)."
+        ),
+    )
+    parser.add_argument(
+        "--canvas_augment_shear_prob",
+        type=float,
+        default=0.55,
+        help="bbox_multiview: per-crop probability for affine shear (horizontal and vertical in one pass).",
+    )
+    parser.add_argument(
+        "--canvas_augment_shear_degrees",
+        type=float,
+        default=26.0,
+        help="bbox_multiview: max shear magnitude in degrees per axis (both axes applied together).",
+    )
+    parser.add_argument(
         "--unified_train_width",
         type=int,
         default=1920,
@@ -335,6 +471,15 @@ def parse_args(input_args=None):
         type=str,
         default="validation_samples",
         help="Dataloader validation: folder under output_dir for PNGs (per-step subfolders inside).",
+    )
+    parser.add_argument(
+        "--validation_canvas_augment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Dataloader validation: when True (default), saved target/canvas PNGs use the same canvas augmentations "
+            "as training (when --canvas_augment). When False, disable augments for clean, repeatable conditioning."
+        ),
     )
     parser.add_argument(
         "--text_encoder_out_layers",

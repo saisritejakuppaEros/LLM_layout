@@ -61,7 +61,7 @@ COMMON_ARGS=(
 
 # Single GPU, plain Python — one process, no NCCL/DDP barriers (avoids long stalls
 # while ranks diverge during heavy CPU work, e.g. FluxTransformer2DModel.from_config).
-export CUDA_VISIBLE_DEVICES=5
+export CUDA_VISIBLE_DEVICES=1
 python train.py "${COMMON_ARGS[@]}"
 
 # Multi-GPU (uncomment): set CUDA_VISIBLE_DEVICES=6,7 and NCCL env before launch.

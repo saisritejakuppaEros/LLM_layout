@@ -2,15 +2,17 @@
 """
 Dataloader smoke test (train.py canvas path).
 
-With ``canvas_conditioning=bbox_multiview`` (default in train_flux2_lora.sh) and **unified**
-resolution (default, no ``--canvas_random_target_resolution``):
+With ``canvas_conditioning=bbox_multiview`` and **unified** resolution (no
+``--canvas_random_target_resolution``):
 
   1) Original scene image from disk (``canvas_target_column`` / ``image_path``).
-  2) Canvas: **1920×1080** composite in ``canvas_bbox_compose`` (letterboxed full frame + bbox
-     crops; aspect preserved), then the **same** unified resize as the target (default
-     ``canvas_unified_resize=contain``) → ``subject_pixel_values`` at **1920×1088** RGB
-     (1080 snapped to /16), matching ``pixel_values`` spatial size.
-  3) Prompt: CSV ``prompt`` if present, else derived from ``class_name``s.
+  2) Canvas: composite in ``canvas_bbox_compose`` at **snapped**
+     ``unified_train_width``×``unified_train_height`` (e.g. **1280×720** for 720p), letterboxed
+     full frame + bbox crops, then the **same** unified resize as the target
+     (``canvas_unified_resize``) → ``subject_pixel_values`` matching ``pixel_values`` spatial size.
+  3) Optional train-time canvas augments (bbox margin, brightness, perspective/shear on up to
+     ``canvas_geom_extreme_max_crops`` crops, mild shear on the rest) when ``--canvas_augment``.
+  4) Prompt: CSV ``prompt`` if present, else derived from ``class_name``s.
 
 ``--cond_size`` defaults to 512 for parity with ``train.py`` but does **not** set H×W here:
 unified mode uses ``unified_train_width`` / ``unified_train_height`` (and ``load_image_safely``
@@ -39,7 +41,7 @@ if str(_TRAIN_DIR) not in sys.path:
 from src.canvas_bbox_compose import build_canvas_for_image_rel
 from src.canvas_dataset import make_canvas_train_dataset, collate_fn_canvas
 from src.flux2_train_helpers import encode_flux2_latents
-from src.jsonl_datasets import resolve_image_path
+from src.jsonl_datasets import multiple_16, resolve_image_path
 
 # Defaults from train_flux2_lora.sh (used directly)
 DEFAULT_MODEL_DIR = (
@@ -106,6 +108,12 @@ def main() -> None:
     parser.add_argument("--canvas_multiview_dir", type=str, default=DEFAULT_MULTIVIEW_DIR)
     parser.add_argument("--canvas_multiview_prob", type=float, default=0.5)
     parser.add_argument("--canvas_background", type=str, default="black", choices=["black", "scaled"])
+    parser.add_argument(
+        "--canvas_geom_extreme_max_crops",
+        type=int,
+        default=3,
+        help="Match train.py: max crops per image with extreme perspective/shear.",
+    )
     parser.add_argument("--canvas_column", type=str, default="canvas_path")
     parser.add_argument("--canvas_target_column", type=str, default="image_path")
     parser.add_argument("--canvas_prompt_column", type=str, default="prompt")
@@ -146,6 +154,64 @@ def main() -> None:
         default=0,
         help="Sample index: CSV row (precomputed) or scene group index (bbox_multiview). -1 = random shuffle.",
     )
+    parser.add_argument(
+        "--canvas_augment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Match train.py: bbox margin / brightness / shear on composed canvas.",
+    )
+    parser.add_argument(
+        "--canvas_augment_bbox_margin_prob",
+        type=float,
+        default=1.0,
+        help="Default 1.0 for this test script so bbox margin runs on every box (when canvas_augment).",
+    )
+    parser.add_argument("--canvas_augment_bbox_margin_min", type=int, default=10)
+    parser.add_argument("--canvas_augment_bbox_margin_max", type=int, default=30)
+    parser.add_argument("--canvas_augment_bbox_expand_prob", type=float, default=0.5)
+    parser.add_argument(
+        "--canvas_augment_brightness_prob",
+        type=float,
+        default=1.0,
+        help="Default 1.0 here so brightness runs every crop for testing; use e.g. 0.88 to match train.py.",
+    )
+    parser.add_argument(
+        "--canvas_augment_brightness_bimodal",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Match train.py: bimodal dim vs lit bands (use --no-canvas_augment_brightness_bimodal for uniform).",
+    )
+    parser.add_argument("--canvas_augment_brightness_min", type=float, default=0.45)
+    parser.add_argument("--canvas_augment_brightness_max", type=float, default=1.85)
+    parser.add_argument("--canvas_augment_brightness_dim_min", type=float, default=0.32)
+    parser.add_argument("--canvas_augment_brightness_dim_max", type=float, default=0.58)
+    parser.add_argument("--canvas_augment_brightness_lit_min", type=float, default=1.42)
+    parser.add_argument("--canvas_augment_brightness_lit_max", type=float, default=2.08)
+    parser.add_argument(
+        "--canvas_augment_global_brightness_prob",
+        type=float,
+        default=1.0,
+        help="Default 1.0 here so global scene brightness always runs when canvas_augment; use e.g. 0.88 for train.py.",
+    )
+    parser.add_argument(
+        "--canvas_augment_perspective_prob",
+        type=float,
+        default=1.0,
+        help="Default 1.0 here so perspective runs every crop when testing; use e.g. 0.48 for train.py.",
+    )
+    parser.add_argument(
+        "--canvas_augment_perspective_distortion",
+        type=float,
+        default=0.62,
+        help="Match train.py: torchvision-style perspective strength.",
+    )
+    parser.add_argument(
+        "--canvas_augment_shear_prob",
+        type=float,
+        default=1.0,
+        help="Default 1.0 here so shear runs every crop for testing; use e.g. 0.55 for train.py.",
+    )
+    parser.add_argument("--canvas_augment_shear_degrees", type=float, default=26.0)
     args = parser.parse_args()
 
     random_res = getattr(args, "canvas_random_target_resolution", False)
@@ -170,10 +236,12 @@ def main() -> None:
     print(f"CSV_PATH (input): {args.csv_path}")
     print(f"canvas_image_root: {args.canvas_image_root}")
     print(f"canvas_conditioning: {args.canvas_conditioning}")
+    uw, uh = multiple_16(args.unified_train_width), multiple_16(args.unified_train_height)
     print(
         f"cond_size={args.cond_size}, noise_size={args.noise_size}, "
-        f"unified={args.unified_train_width}×{args.unified_train_height}, "
-        f"canvas_unified_resize={args.canvas_unified_resize}, batch_size={args.train_batch_size}"
+        f"unified(nominal)={args.unified_train_width}×{args.unified_train_height} → snapped={uw}×{uh}, "
+        f"canvas_unified_resize={args.canvas_unified_resize}, batch_size={args.train_batch_size}, "
+        f"canvas_augment={args.canvas_augment}"
     )
     print()
 
@@ -266,7 +334,9 @@ def main() -> None:
         if train_dataset.conditioning == "bbox_multiview":
             rel_g, group_rows = train_dataset.groups[args.dataset_index]
             full_pil = Image.open(resolve_image_path(rel_g, root)).convert("RGB")
-            comp = build_canvas_for_image_rel(
+            cw, ch = train_dataset._compose_canvas_wh
+            aug_kw = train_dataset._canvas_augment_kwargs()
+            comp_clean = build_canvas_for_image_rel(
                 rel_g,
                 full_pil,
                 group_rows,
@@ -275,12 +345,33 @@ def main() -> None:
                 train_dataset._canvas_background,
                 args.seed,
                 train_dataset._bbox_min_side,
+                cw,
+                ch,
+                extreme_geom_max_crops=args.canvas_geom_extreme_max_crops,
+                augment=False,
             )
-            comp.save(out_dir / "composed_canvas_1920x1080.png")
+            out_clean = out_dir / f"composed_canvas_{cw}x{ch}_no_aug.png"
+            comp_clean.save(out_clean)
             print(
-                f"Composed conditioning canvas (letterbox layout, pre-unified tensor): "
-                f"{comp.size[0]}×{comp.size[1]} (W×H) → saved {out_dir / 'composed_canvas_1920x1080.png'}"
+                f"Composed canvas (no aug, pre-unified resize): {comp_clean.size[0]}×{comp_clean.size[1]} (W×H) → {out_clean}"
             )
+            comp_aug = build_canvas_for_image_rel(
+                rel_g,
+                full_pil,
+                group_rows,
+                train_dataset._multiview_root,
+                train_dataset._multiview_prob,
+                train_dataset._canvas_background,
+                args.seed,
+                train_dataset._bbox_min_side,
+                cw,
+                ch,
+                extreme_geom_max_crops=args.canvas_geom_extreme_max_crops,
+                **aug_kw,
+            )
+            out_aug = out_dir / f"composed_canvas_{cw}x{ch}_aug.png"
+            comp_aug.save(out_aug)
+            print(f"Composed canvas (with aug): {comp_aug.size[0]}×{comp_aug.size[1]} (W×H) → {out_aug}")
         else:
             ck = _row_canvas_key(row, args.canvas_column)
             if ck:

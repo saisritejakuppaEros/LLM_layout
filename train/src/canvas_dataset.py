@@ -11,7 +11,13 @@ import torch
 from PIL import Image
 from torchvision import transforms
 
-from .canvas_bbox_compose import build_canvas_for_image_rel, prepare_groups_from_flat_rows, prompt_for_group
+from .canvas_bbox_compose import (
+    CANVAS_H,
+    CANVAS_W,
+    build_canvas_for_image_rel,
+    prepare_groups_from_flat_rows,
+    prompt_for_group,
+)
 from .jsonl_datasets import get_random_resolution, load_image_safely, multiple_16
 
 Image.MAX_IMAGE_PIXELS = None
@@ -107,15 +113,18 @@ class CanvasSceneDataset(torch.utils.data.Dataset):
       optional ``canvas_column`` / ``subject_path`` file for subject pixels.
 
     - ``bbox_multiview``: one sample per distinct scene image (grouped by ``canvas_target_column``).
-      Target = full scene; subject = composed canvas (internally 1920×1080 in ``canvas_bbox_compose``).
+      Target = full scene; subject = composed canvas at ``(unified_train_width, unified_train_height)`` (snapped
+      to /16), matching ``canvas_bbox_compose`` letterbox size (default **1920×1080** if not unified). Strong
+      perspective/shear applies to at most ``canvas_geom_extreme_max_crops`` crops per image (default **3**);
+      remaining crops use mild geometry.
 
     **Unified resolution (default):** unless ``args.canvas_random_target_resolution`` is set, both target and
     canvas are resized to the same box: ``(unified_train_width, unified_train_height)`` (defaults **1920×1080**),
-    snapped to multiples of 16 (1080→1088 for FLUX patchify). The bbox canvas from ``canvas_bbox_compose`` is
-    **1920×1080**; pairing uses ``args.canvas_unified_resize``:
+    snapped to multiples of 16 (1080→1088 for FLUX patchify). The bbox canvas is built at that same snapped size;
+    pairing uses ``args.canvas_unified_resize``:
 
-    - ``contain`` (default): scale to **fit inside** the box, **letterbox** with black — no crop; a 1920×1080
-      canvas and a 16:9 full frame both pick up matching thin bars in a 1920×1088 tensor.
+    - ``contain`` (default): scale to **fit inside** the box, **letterbox** with black — no crop; e.g. a 1920×1080
+      canvas and a 16:9 full frame both pick up matching thin bars after snap.
     - ``cover``: scale to **fill** the box, then **center-crop** — can cut edges when aspect ≠ box.
 
     Same latent grid for batched training in both modes.
@@ -174,6 +183,11 @@ class CanvasSceneDataset(torch.utils.data.Dataset):
             self._canvas_background = getattr(args, "canvas_background", "black")
             self._bbox_min_side = float(getattr(args, "canvas_bbox_min_side", 0.0))
             self._mv_match_min = float(getattr(args, "canvas_multiview_match_min_side", 200.0))
+            if self._unified_wh is not None:
+                self._compose_canvas_wh = self._unified_wh
+            else:
+                self._compose_canvas_wh = (CANVAS_W, CANVAS_H)
+            self._canvas_augment_enabled = True
             self.groups: List[Tuple[str, List[Dict[str, Any]]]] = prepare_groups_from_flat_rows(
                 flat_rows,
                 target_column,
@@ -189,6 +203,8 @@ class CanvasSceneDataset(torch.utils.data.Dataset):
             self.groups = []
             self.rows = flat_rows
             self._multiview_root = None
+            self._compose_canvas_wh = (CANVAS_W, CANVAS_H)
+            self._canvas_augment_enabled = True
 
     def __len__(self):
         if self.conditioning == "bbox_multiview":
@@ -218,10 +234,43 @@ class CanvasSceneDataset(torch.utils.data.Dataset):
             return self._getitem_bbox_multiview(idx)
         return self._getitem_precomputed(idx)
 
+    def _canvas_augment_kwargs(self) -> Dict[str, Any]:
+        a = self.args
+        augment = bool(
+            getattr(self, "_canvas_augment_enabled", True) and getattr(a, "canvas_augment", True)
+        )
+        gbp = float(getattr(a, "canvas_augment_global_brightness_prob", 0.88))
+        if not augment:
+            gbp = 0.0
+        return {
+            "augment": augment,
+            "bbox_margin_prob": float(getattr(a, "canvas_augment_bbox_margin_prob", 1.0)),
+            "bbox_margin_min": int(getattr(a, "canvas_augment_bbox_margin_min", 10)),
+            "bbox_margin_max": int(getattr(a, "canvas_augment_bbox_margin_max", 30)),
+            "bbox_expand_prob": float(getattr(a, "canvas_augment_bbox_expand_prob", 0.5)),
+            "brightness_prob": float(getattr(a, "canvas_augment_brightness_prob", 0.88)),
+            "brightness_bimodal": bool(getattr(a, "canvas_augment_brightness_bimodal", True)),
+            "brightness_min": float(getattr(a, "canvas_augment_brightness_min", 0.45)),
+            "brightness_max": float(getattr(a, "canvas_augment_brightness_max", 1.85)),
+            "brightness_dim_min": float(getattr(a, "canvas_augment_brightness_dim_min", 0.32)),
+            "brightness_dim_max": float(getattr(a, "canvas_augment_brightness_dim_max", 0.58)),
+            "brightness_lit_min": float(getattr(a, "canvas_augment_brightness_lit_min", 1.42)),
+            "brightness_lit_max": float(getattr(a, "canvas_augment_brightness_lit_max", 2.08)),
+            "global_brightness_prob": gbp,
+            "perspective_prob": float(getattr(a, "canvas_augment_perspective_prob", 0.48)),
+            "perspective_distortion_scale": float(
+                getattr(a, "canvas_augment_perspective_distortion", 0.62)
+            ),
+            "shear_prob": float(getattr(a, "canvas_augment_shear_prob", 0.55)),
+            "shear_degrees": float(getattr(a, "canvas_augment_shear_degrees", 26.0)),
+        }
+
     def _getitem_bbox_multiview(self, idx: int) -> Dict[str, Any]:
         rel, group_rows = self.groups[idx]
         full = load_image_safely(rel, self.args.cond_size, root_dir=self._image_root)
 
+        cw, ch = self._compose_canvas_wh
+        geom_extreme = int(getattr(self.args, "canvas_geom_extreme_max_crops", 3))
         canvas_pil = build_canvas_for_image_rel(
             rel,
             full,
@@ -231,6 +280,10 @@ class CanvasSceneDataset(torch.utils.data.Dataset):
             self._canvas_background,
             getattr(self.args, "seed", None),
             self._bbox_min_side,
+            cw,
+            ch,
+            extreme_geom_max_crops=geom_extreme,
+            **self._canvas_augment_kwargs(),
         )
 
         if self._unified_wh is not None:
