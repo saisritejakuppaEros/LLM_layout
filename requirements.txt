@@ -1,0 +1,10 @@
+torch>=2.0
+diffusers>=0.32.0
+transformers
+accelerate
+safetensors
+pyyaml
+pillow
+torchvision
+lpips
+logzero

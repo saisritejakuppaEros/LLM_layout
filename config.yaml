@@ -1,0 +1,102 @@
+# BBox canvas modulation — paths (override for your machine)
+pretrained_model_name_or_path: "/mnt/data0/teja/research_multiref/llm_based_layout/models/models--black-forest-labs--FLUX.2-dev/snapshots/26afe3a78bb242c0a8bb181dcc8937bb16e5c66c"
+csv_path: "/mnt/data0/teja/multiref_image/model_training_dataset/output/bbox_results/yolo26_detections.csv"
+canvas_metadata_jsonl: "/mnt/data0/teja/multiref_image/dataset/metadata.jsonl"
+canvas_target_column: "image_abspath"
+canvas_prompt_column: "prompt"
+canvas_image_root: ""
+
+unified_train_width: 1280
+unified_train_height: 720
+canvas_unified_resize: "contain"
+canvas_bbox_min_side: 0
+
+curriculum_stage: 3
+
+# With this probability, replace batch prompts with "" so the step trains LoRA + bbox adapter without text.
+empty_caption_prob: 0.4
+
+learning_rate: 1.0e-4
+train_batch_size: 1
+gradient_accumulation_steps: 1
+num_train_epochs: 1000
+max_train_steps: null
+
+mixed_precision: "bf16"
+# Essential for FLUX.2 at 1280×720: without checkpointing, layer activations dominate VRAM (~100GB+).
+gradient_checkpointing: true
+# Run LPIPS aux on CPU so VGG weights do not sit on GPU during the DiT forward/backward.
+lpips_on_cpu: true
+guidance_scale: 1.0
+max_sequence_length: 256
+text_encoder_out_layers: [10, 20, 30]
+
+weighting_scheme: "none"
+logit_mean: 0.0
+logit_std: 1.0
+mode_scale: 1.29
+
+adapter_dim: 1024
+latent_feat_channels: 128
+lora_rank: 16
+lora_alpha: 16
+use_lora: true
+ranks: [16]
+network_alphas: [16]
+lora_num: 1
+# LoRA only on the last N blocks per stream. Each LoRA processor is heavy at 1280×720; training all 8+56
+# blocks can fill ~140GB. Use small N (e.g. 2 + 8) and increase if VRAM allows. 0 = no LoRA on that stream.
+# Full model: 8 double + 48 single; set N >= count to cover all blocks in that stream.
+lora_last_double_blocks: 2
+lora_last_single_blocks: 8
+
+bbox_loss_weight: 0.5
+bg_loss_weight: 0.3
+aux_loss_every_n_steps: 10
+# Console (logzero) training progress every N optimizer steps
+log_every_n_steps: 10
+
+mlp_gate_final_bias: -1.0
+
+layer_strength:
+  first_frac: 0.3
+  mid_frac: 0.7
+  first_scale: 0.2
+  mid_scale: 0.6
+  last_scale: 1.0
+
+overlap_mode: "sum"
+
+alpha_feather_px: 4.0
+canvas_aug_scale_jitter: 0.15
+canvas_aug_translate_px: 5
+
+max_boxes: 32
+
+output_dir: "./output/bbox_mod_checkpoints"
+logging_dir: "./output/bbox_mod_checkpoints/logs"
+# One CSV row per optimizer step (main process): step, loss, loss_diffusion, lr, gate_mean, loss_lpips, loss_bg_l2 (aux cols blank when aux skipped).
+loss_csv_enabled: true
+loss_csv_filename: "training_loss.csv"
+# loss_csv_path: null  # optional absolute path; if set, overrides output_dir + loss_csv_filename
+checkpointing_steps: 1000
+validation_steps: 100
+# Sample uses first item in batch; kept for future multi-sample support.
+validation_num_samples: 1
+# Flow-matching denoise steps for sample.png (bbox adapter + LoRA, same conditioning as training).
+validation_inference_steps: 50
+validation_save_inference: true
+validation_samples_subdir: "validation_samples"
+seed: 42
+
+dataloader_num_workers: 2
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 0.01
+adam_epsilon: 1.0e-8
+max_grad_norm: 1.0
+lr_scheduler: "constant"
+lr_warmup_steps: 0
+
+resume_from_checkpoint: null
+checkpoints_total_limit: null
