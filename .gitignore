@@ -1,1 +1,3 @@
 *.pyc
+train/output
+train/src/__pycache__

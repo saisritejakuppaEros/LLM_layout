@@ -245,6 +245,26 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
+        "--depth_keep_prob",
+        type=float,
+        default=0.5,
+        help=(
+            "When depth_image_root is set: per-sample probability to use the real depth map for cond_pixel_values; "
+            "otherwise a black RGB image of the same crop size (depth LoRA stream still receives a blank block). "
+            "Use 1.0 to always keep real depth. Dataloader validation forces 1.0 while sampling for clearer PNGs."
+        ),
+    )
+    parser.add_argument(
+        "--canvas_keep_prob",
+        type=float,
+        default=0.5,
+        help=(
+            "Per-sample probability to keep the real conditioning canvas in subject_pixel_values; otherwise replace "
+            "with a black canvas in model space (same tensor shape, values -1). Use 1.0 to disable. "
+            "Dataloader validation forces 1.0 while sampling for clearer PNGs."
+        ),
+    )
+    parser.add_argument(
         "--caption_dir",
         type=str,
         default="/mnt/data0/teja/research_multiref/dataset_preparation/output/image_captions",

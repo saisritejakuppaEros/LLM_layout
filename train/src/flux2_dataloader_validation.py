@@ -305,6 +305,14 @@ def run_dataloader_validation(
         train_dataset._canvas_augment_enabled = False
     else:
         _saved_canvas_aug = None
+    _saved_depth_keep: Optional[float] = None
+    if hasattr(train_dataset, "_depth_keep_prob"):
+        _saved_depth_keep = float(train_dataset._depth_keep_prob)
+        train_dataset._depth_keep_prob = 1.0
+    _saved_canvas_keep: Optional[float] = None
+    if hasattr(train_dataset, "_canvas_keep_prob"):
+        _saved_canvas_keep = float(train_dataset._canvas_keep_prob)
+        train_dataset._canvas_keep_prob = 1.0
     batch: Dict[str, Any]
     dataset_indices: List[int]
     try:
@@ -320,6 +328,10 @@ def run_dataloader_validation(
     finally:
         if _saved_canvas_aug is not None:
             train_dataset._canvas_augment_enabled = _saved_canvas_aug
+        if _saved_depth_keep is not None:
+            train_dataset._depth_keep_prob = _saved_depth_keep
+        if _saved_canvas_keep is not None:
+            train_dataset._canvas_keep_prob = _saved_canvas_keep
     device = accelerator.device
 
     was_training = transformer.training

@@ -7,6 +7,9 @@ MODEL_DIR="/mnt/data0/teja/research_multiref/llm_based_layout/models/models--bla
 CSV_PATH="/mnt/data0/teja/research_multiref/dataset_preparation/output/bbox_results/yolo26_detections.csv"
 CANVAS_IMAGE_ROOT="/mnt/data0/teja/research_multiref/dataset_preparation/output/images"
 DEPTH_IMAGE_ROOT="/mnt/data0/teja/research_multiref/dataset_preparation/output/depth"
+# Per-sample prob to keep real depth / canvas (else black cond). Override: DEPTH_KEEP_PROB=1 CANVAS_KEEP_PROB=1 ./train_flux2_lora.sh
+DEPTH_KEEP_PROB="${DEPTH_KEEP_PROB:-0.5}"
+CANVAS_KEEP_PROB="${CANVAS_KEEP_PROB:-0.5}"
 CAPTION_DIR="/mnt/data0/teja/research_multiref/dataset_preparation/output/image_captions"
 MULTIVIEW_DIR="/mnt/data0/teja/research_multiref/dataset_preparation/output/multiview_out"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,6 +23,8 @@ COMMON_ARGS=(
   --csv_path "$CSV_PATH"
   --canvas_image_root "$CANVAS_IMAGE_ROOT"
   --depth_image_root "$DEPTH_IMAGE_ROOT"
+  --depth_keep_prob "$DEPTH_KEEP_PROB"
+  --canvas_keep_prob "$CANVAS_KEEP_PROB"
   --canvas_conditioning bbox_multiview
   --canvas_bbox_min_side 0
   --canvas_multiview_match_min_side 200

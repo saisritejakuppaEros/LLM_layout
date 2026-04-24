@@ -449,6 +449,14 @@ class CanvasSceneDataset(torch.utils.data.Dataset):
                 "depth_image_root is set: use unified training resolution (do not pass --canvas_random_target_resolution)."
             )
 
+        self._depth_keep_prob = float(getattr(args, "depth_keep_prob", 1.0))
+        if not (0.0 <= self._depth_keep_prob <= 1.0):
+            raise ValueError(f"depth_keep_prob must be in [0, 1], got {self._depth_keep_prob}")
+
+        self._canvas_keep_prob = float(getattr(args, "canvas_keep_prob", 1.0))
+        if not (0.0 <= self._canvas_keep_prob <= 1.0):
+            raise ValueError(f"canvas_keep_prob must be in [0, 1], got {self._canvas_keep_prob}")
+
         cap = getattr(args, "caption_dir", None)
         self._caption_root: Optional[Path] = None
         if isinstance(cap, str) and cap.strip():
@@ -563,6 +571,30 @@ class CanvasSceneDataset(torch.utils.data.Dataset):
         depth = load_depth_image_as_rgb_pil(p)
         return resize_cover_pil(depth, tw, th)
 
+    def _finalize_depth_cond(self, depth_pil: Image.Image, tw: int, th: int) -> Image.Image:
+        """Stochastic depth: keep real map with ``_depth_keep_prob``, else black RGB (same size as target crop)."""
+        if self._depth_root is None:
+            return depth_pil
+        kp = float(self._depth_keep_prob)
+        if kp >= 1.0:
+            return depth_pil
+        if kp <= 0.0:
+            return Image.new("RGB", (tw, th), (0, 0, 0))
+        if float(np.random.random()) < kp:
+            return depth_pil
+        return Image.new("RGB", (tw, th), (0, 0, 0))
+
+    def _finalize_subject_pixel_tensor(self, t: torch.Tensor) -> torch.Tensor:
+        """Stochastic canvas: keep real conditioning with ``_canvas_keep_prob``, else black (-1 in normalized space)."""
+        kp = float(self._canvas_keep_prob)
+        if kp >= 1.0:
+            return t
+        if kp <= 0.0:
+            return torch.full_like(t, -1.0)
+        if float(np.random.random()) < kp:
+            return t
+        return torch.full_like(t, -1.0)
+
     def _getitem_bbox_multiview(self, idx: int) -> Dict[str, Any]:
         rel, group_rows = self.groups[idx]
         full = load_image_safely(rel, self.args.cond_size, root_dir=self._image_root)
@@ -594,8 +626,10 @@ class CanvasSceneDataset(torch.utils.data.Dataset):
             )
 
             pixel_values = pil_to_model_tensor(cropped_full)
-            subject_pixel_values = pil_to_model_tensor(canvas_pil)
+            subject_pixel_values = self._finalize_subject_pixel_tensor(pil_to_model_tensor(canvas_pil))
             depth_u = self._maybe_depth_for_rel(rel, tw, th)
+            if depth_u is not None:
+                depth_u = self._finalize_depth_cond(depth_u, tw, th)
         else:
             canvas_pil = build_canvas_for_image_rel(
                 rel,
@@ -614,7 +648,9 @@ class CanvasSceneDataset(torch.utils.data.Dataset):
             )
             noise_size = get_random_resolution(max_size=self.args.noise_size)
             pixel_values = self._target_transform(full, noise_size)
-            subject_pixel_values = self.subject_transform_layout_preserving(canvas_pil)
+            subject_pixel_values = self._finalize_subject_pixel_tensor(
+                self.subject_transform_layout_preserving(canvas_pil)
+            )
 
         base_prompt = prompt_for_group(group_rows, self.prompt_column)
         prompt = self._read_caption_for_rel(rel, base_prompt)
@@ -639,6 +675,8 @@ class CanvasSceneDataset(torch.utils.data.Dataset):
             tw, th = self._unified_wh
             tgt_u = resize_cover_pil(target.convert("RGB"), tw, th)
             depth_u_for_cond = self._maybe_depth_for_rel(rel, tw, th)
+            if depth_u_for_cond is not None:
+                depth_u_for_cond = self._finalize_depth_cond(depth_u_for_cond, tw, th)
             pixel_values = pil_to_model_tensor(tgt_u)
         else:
             noise_size = get_random_resolution(max_size=self.args.noise_size)
@@ -654,9 +692,11 @@ class CanvasSceneDataset(torch.utils.data.Dataset):
             canvas = load_image_safely(row[canvas_key], self.args.cond_size, root_dir=self._image_root)
             if self._unified_wh is not None:
                 tw, th = self._unified_wh
-                out["subject_pixel_values"] = pil_to_model_tensor(resize_cover_pil(canvas.convert("RGB"), tw, th))
+                out["subject_pixel_values"] = self._finalize_subject_pixel_tensor(
+                    pil_to_model_tensor(resize_cover_pil(canvas.convert("RGB"), tw, th))
+                )
             else:
-                out["subject_pixel_values"] = self.subject_transform(canvas)
+                out["subject_pixel_values"] = self._finalize_subject_pixel_tensor(self.subject_transform(canvas))
 
         if depth_u_for_cond is not None:
             out["cond_pixel_values"] = pil_to_model_tensor(depth_u_for_cond)
