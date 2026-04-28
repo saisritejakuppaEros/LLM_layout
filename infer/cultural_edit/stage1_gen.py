@@ -1,11 +1,29 @@
-# ``objects_dict`` maps detector keys → cutout filenames (PNG) under
-# inference_data/ads/set_1/background_remove_imgs from mask_bg.py.
+# Ensure sibling ``layout_canvas_utils`` imports when cwd != this directory.
+import sys
+from pathlib import Path
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
 from layout_canvas_utils import (
-    OBJECTS_DICT as objects_dict,
     OBJECT_DETECTION_QUERIES,
     compose_layout_from_bbox_csv,
     read_bbox_csv as _read_bbox_csv,
 )
+
+# Cutouts in ``bg_removed/`` (only these two assets). Keys must match
+# ``CULTURAL_DETECTION_QUERIES``; phrases should match what Grounding DINO
+# returns for your FLUX scene (substring match in ``resolve_label_to_object_key``).
+BG_REMOVED_DIR = _SCRIPT_DIR / "bg_removed"
+CULTURAL_OBJECTS_DICT: dict[str, str] = {
+    "boy": "upanayanam.png",
+    "celebrity": "srk_2.png",
+}
+CULTURAL_DETECTION_QUERIES: dict[str, str] = {
+    "boy": "a young boy in traditional white clothing sitting cross legged",
+    "celebrity": "a man wearing an elegant deep blue sherwani",
+}
 
 ai_prompt = """
 A realistic Indian cultural ceremony scene set in a softly lit traditional indoor environment. In the center, a young boy sits cross-legged on the floor wearing traditional white attire, participating in a sacred thread ceremony (upanayanam). A middle-aged priest/father figure, bare-chested with a dhoti, is carefully guiding the ritual, holding and placing a sacred thread (yajnopavita) across the boy’s shoulder with focused attention. Ritual items like a small fire (havan), brass vessels, flowers, and offerings are placed neatly around them on a mat.
@@ -22,7 +40,6 @@ Style: photorealistic, high detail, natural skin tones, cinematic lighting, 35mm
 import csv
 import gc
 import os
-from pathlib import Path
 
 import torch
 from PIL import Image, ImageDraw, ImageFont
@@ -119,6 +136,9 @@ def run_layout_stages(
     prompt_file: str | Path,
     pipe: Flux2Pipeline | None = None,
     layout_seed: int = 42,
+    asset_dir: str | Path | None = None,
+    objects_dict: dict[str, str] | None = None,
+    detection_queries: dict[str, str] | None = None,
 ) -> Path:
     """
     Full layout path: T2I → bbox CSV → debug overlay → composite PNG → write ``prompt_file``.
@@ -136,12 +156,19 @@ def run_layout_stages(
         pipe=pipe,
         seed=layout_seed,
     )
-    get_bbox(str(image_path), output_csv=str(bbox_csv))
+    get_bbox(
+        str(image_path),
+        output_csv=str(bbox_csv),
+        detection_queries=detection_queries,
+    )
     debug_png = image_path.with_name(f"{image_path.stem}_debug_bbox.png")
     debug_bboxes(str(image_path), str(bbox_csv), draw_output_path=str(debug_png), draw=True)
     compose_layout_from_bbox_csv(
         str(bbox_csv),
         reference_image_path=str(image_path),
+        asset_dir=asset_dir,
+        objects_dict=objects_dict,
+        detection_queries=detection_queries,
     )
     prompt_file.write_text(scene_prompt.strip(), encoding="utf-8")
     print(f"Wrote {prompt_file} for LoRA --prompt_file")
@@ -171,6 +198,7 @@ def get_bbox(
     output_csv=None,
     threshold=0.4,
     text_threshold=0.3,
+    detection_queries: dict[str, str] | None = None,
 ):
     """
     Run Grounding DINO on ``image_path`` and write detections to a CSV file.
@@ -188,7 +216,8 @@ def get_bbox(
     processor, model = _get_grounding_dino(device)
 
     image = Image.open(path).convert("RGB")
-    text_labels = [list(OBJECT_DETECTION_QUERIES.values())]
+    queries = detection_queries if detection_queries is not None else OBJECT_DETECTION_QUERIES
+    text_labels = [list(queries.values())]
 
     inputs = processor(images=image, text=text_labels, return_tensors="pt").to(device)
     with torch.no_grad():
@@ -379,6 +408,21 @@ if __name__ == "__main__":
 
     # Optional: full pipeline (FLUX generation + detection; needs GPU, slow).
     prompt_file = Path(os.environ.get("PROMPT_FILE", "scene_prompt.txt"))
+    use_cultural = os.environ.get("USE_CULTURAL_CUTOUTS", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    asset_dir = BG_REMOVED_DIR if use_cultural else None
+    objects_dict = CULTURAL_OBJECTS_DICT if use_cultural else None
+    detection_queries = CULTURAL_DETECTION_QUERIES if use_cultural else None
+    if use_cultural and not BG_REMOVED_DIR.is_dir():
+        raise FileNotFoundError(f"Expected cutout directory: {BG_REMOVED_DIR}")
+    for fname in (objects_dict or {}).values():
+        p = (asset_dir or _SCRIPT_DIR) / fname
+        if use_cultural and not p.is_file():
+            raise FileNotFoundError(f"Missing reference cutout: {p}")
+
     composite = run_layout_stages(
         scene_prompt,
         image_path=image_path,
@@ -386,6 +430,9 @@ if __name__ == "__main__":
         prompt_file=prompt_file,
         pipe=None,
         layout_seed=42,
+        asset_dir=asset_dir,
+        objects_dict=objects_dict,
+        detection_queries=detection_queries,
     )
     print(f"Wrote {prompt_file} for --prompt_file with flux2_lora_inference.py")
     print(
