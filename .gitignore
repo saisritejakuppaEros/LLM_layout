@@ -1,3 +1,5 @@
 *.pyc
 train/output
 train/src/__pycache__
+dataset_prep_v2/output/
+dataset_prep_v2/yolo26n.pt

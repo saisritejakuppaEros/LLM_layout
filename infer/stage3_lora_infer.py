@@ -13,6 +13,18 @@ Run from anywhere::
 Or from ``infer/``::
 
     python stage3_lora_infer.py --help
+
+Three conditioning ablations (black depth, black canvas, both real)::
+
+    python stage3_lora_infer.py --cond_variants
+
+Time-varying depth vs. canvas (structure) LoRA strength per denoise step::
+
+    python stage3_lora_infer.py --lora_interval_schedule
+
+First 4 denoise steps depth-heavy, all later steps appearance-heavy (no t1/t2/t3 curve)::
+
+    python stage3_lora_infer.py --lora_first_depth_steps 4
 """
 
 from __future__ import annotations
@@ -58,7 +70,7 @@ _DEFAULT_LORA = os.environ.get(
         _TRAIN_DIR
         / "output"
         / "lora_checkpoints_v2"
-        / "checkpoint-2000"
+        / "checkpoint-13000"
         / "lora.safetensors"
     ),
 )
@@ -76,7 +88,7 @@ def _attach_lora(
     network_alphas: list[int],
     unified_w: int,
     unified_h: int,
-) -> None:
+) -> list[float]:
     dim = transformer.inner_dim
     sa0 = transformer.single_transformer_blocks[0].attn
     s_inner, s_mlp_h, s_mlp_mf = sa0.inner_dim, sa0.mlp_hidden_dim, sa0.mlp_mult_factor
@@ -119,6 +131,55 @@ def _attach_lora(
         else:
             lora_attn_procs[name] = attn_processor
     transformer.set_attn_processor(lora_attn_procs)
+    return lora_w
+
+
+def _lora_interval_w_canvas_depth(
+    frac: float,
+    *,
+    t1: float,
+    t2: float,
+    t3: float,
+    tail: float,
+) -> tuple[float, float]:
+    """Map denoise progress ``frac`` in [0, 1] to (canvas/structure, depth) LoRA weights.
+
+    LoRA index 0 = canvas, 1 = depth. Early: depth-forward but canvas 0.5/0.98. Mid: canvas to 1.0 by t2, depth
+    to ~0.2. t2..t3: full canvas, depth 0.2 to 0.1. For ``f > t3``, both scale toward ``tail``.
+    """
+    f = 0.0 if frac < 0.0 else 1.0 if frac > 1.0 else float(frac)
+
+    def lerp_on(u: float, a: float, b: float, va: float, vb: float) -> float:
+        if a >= b - 1e-8:
+            return vb
+        if u <= a:
+            return va
+        if u >= b:
+            return vb
+        t = (u - a) / (b - a)
+        return va + t * (vb - va)
+
+    if t1 >= t2 or t2 >= t3 or t3 > 1.0 or t1 <= 0.0:
+        return 1.0, 1.0
+
+    # Appearance (canvas) is weighted higher than the original 0.2/0.95/1.0 schedule:
+    # earlier ramp to 1.0, slightly less extreme depth-dominant early.
+    if f < t1:
+        w_s, w_d = 0.5, 0.98
+    elif f < t2:
+        w_s = lerp_on(f, t1, t2, 0.5, 1.0)
+        w_d = lerp_on(f, t1, t2, 0.98, 0.2)
+    elif f <= t3:
+        w_s = 1.0
+        w_d = lerp_on(f, t2, t3, 0.2, 0.1)
+    else:
+        w_s0, w_d0 = 1.0, 0.1
+        m = 1.0
+        if tail < 1.0:
+            span = max(1.0 - t3, 1e-6)
+            m = 1.0 - (1.0 - tail) * (f - t3) / span
+        w_s, w_d = w_s0 * m, w_d0 * m
+    return w_s, w_d
 
 
 def main() -> None:
@@ -135,6 +196,66 @@ def main() -> None:
         help="Scene prompt. If omitted, uses DEFAULT_SCENE_PROMPT (same text as stage1 ``ai_prompt``).",
     )
     p.add_argument("--output", type=str, default=str(_INFER_DIR / "lora_infer_out.png"))
+    p.add_argument(
+        "--cond_variants",
+        action="store_true",
+        help="Write three images (suffix _depth_black, _canvas_black, _both): black depth+real canvas, black canvas+real depth, and both real (same seed).",
+    )
+    p.add_argument(
+        "--lora_interval_schedule",
+        action="store_true",
+        help=(
+            "Per-denoise-step LoRA mix: 0..t1 depth strong / structure weak; t1..t2 crossfade; t2..t3 structure high / depth low; "
+            "after t3 both scale toward --lora_interval_tail (set to 1.0 to skip). Requires --lora_num 2. "
+            "If --lora_first_depth_steps > 0, that two-phase block overrides this curve."
+        ),
+    )
+    p.add_argument(
+        "--lora_interval_t1",
+        type=float,
+        default=0.25,
+        metavar="F",
+        help="Interval schedule: end of early segment (default 0.25).",
+    )
+    p.add_argument(
+        "--lora_interval_t2",
+        type=float,
+        default=0.70,
+        metavar="F",
+        help="End of crossfade (default 0.70).",
+    )
+    p.add_argument(
+        "--lora_interval_t3",
+        type=float,
+        default=0.90,
+        metavar="F",
+        help="Start of final tail scaling (default 0.90).",
+    )
+    p.add_argument(
+        "--lora_interval_tail",
+        type=float,
+        default=0.85,
+        metavar="F",
+        help="At progress=1.0, both LoRAs scale to this (relative to 1,1 at t3+). 1.0 = no last-segment pull-back.",
+    )
+    p.add_argument(
+        "--lora_interval_appearance_strength",
+        type=float,
+        default=1.0,
+        metavar="F",
+        help="Extra multiplier on the canvas/appearance (LoRA0) weight after the interval curve; clamped to 1.5. 1.0 = use curve as-is.",
+    )
+    p.add_argument(
+        "--lora_first_depth_steps",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "If N>0, use a simple two-phase mix (requires --lora_num 2): first N denoise steps depth LoRA strong / canvas low; "
+            "remaining steps canvas strong / depth low. N is a step count, not a fraction. "
+            "When N>0 this overrides the t1/t2/t3 piecewise curve. Example: --lora_first_depth_steps 4."
+        ),
+    )
     p.add_argument("--unified_width", type=int, default=1280)
     p.add_argument("--unified_height", type=int, default=720)
     p.add_argument("--canvas_unified_resize", type=str, default="cover", choices=["cover", "contain"])
@@ -154,6 +275,14 @@ def main() -> None:
         help="Branch used only for latent **shape** (noise is random): black RGB or same as canvas after cover resize.",
     )
     ns = p.parse_args()
+    lora_limited_schedule = bool(ns.lora_interval_schedule) or int(ns.lora_first_depth_steps) > 0
+    if lora_limited_schedule:
+        if int(ns.lora_num) != 2:
+            raise SystemExit("LoRA step mixing requires --lora_num 2 (LoRA0=canvas, LoRA1=depth).")
+    if ns.lora_interval_schedule and int(ns.lora_first_depth_steps) <= 0:
+        t1, t2, t3i = float(ns.lora_interval_t1), float(ns.lora_interval_t2), float(ns.lora_interval_t3)
+        if t1 >= t2 or t2 >= t3i or t3i > 1.0 or t1 <= 0.0:
+            raise SystemExit("Require 0 < lora_interval_t1 < lora_interval_t2 < lora_interval_t3 <= 1.")
 
     tw = multiple_16(ns.unified_width)
     th = multiple_16(ns.unified_height)
@@ -221,7 +350,7 @@ def main() -> None:
     text_encoder.to(device, dtype=weight_dtype)
     transformer.to(device, dtype=weight_dtype)
 
-    _attach_lora(
+    lora_w = _attach_lora(
         transformer,
         device=device,
         weight_dtype=weight_dtype,
@@ -239,13 +368,28 @@ def main() -> None:
     if unexpected:
         print(f"Warning: {len(unexpected)} unexpected keys (first 5): {unexpected[:5]}")
 
+    if lora_limited_schedule:
+        if int(ns.lora_first_depth_steps) > 0:
+            print(
+                f"LoRA block schedule: first {int(ns.lora_first_depth_steps)} step(s) depth-LoRA priority, "
+                f"then canvas/appearance-LoRA priority; appearance_strength={ns.lora_interval_appearance_strength}.",
+            )
+        if ns.lora_interval_schedule and int(ns.lora_first_depth_steps) <= 0:
+            print(
+                f"LoRA interval schedule: t1={ns.lora_interval_t1} t2={ns.lora_interval_t2} "
+                f"t3={ns.lora_interval_t3} tail@1.0={ns.lora_interval_tail} "
+                f"appearance_strength={ns.lora_interval_appearance_strength} (canvas, depth weighter each step).",
+            )
+
     transformer.eval()
     vae.eval()
     text_encoder.eval()
 
+    black_u = Image.new("RGB", (tw, th), (0, 0, 0))
+    black_t = pil_to_model_tensor(black_u).unsqueeze(0)
     pv = pil_to_model_tensor(target_u).unsqueeze(0)
-    subj = pil_to_model_tensor(canvas_u).unsqueeze(0)
-    cond = pil_to_model_tensor(depth_u).unsqueeze(0)
+    subj_full = pil_to_model_tensor(canvas_u).unsqueeze(0)
+    cond_full = pil_to_model_tensor(depth_u).unsqueeze(0)
 
     pe, tid = encode_prompts_flux2(
         text_encoder,
@@ -257,30 +401,69 @@ def main() -> None:
         tuple(ns.text_encoder_out_layers),
     )
 
-    gen = torch.Generator(device=device).manual_seed(int(ns.seed))
-    with torch.inference_mode():
-        out_pil = _denoise_one(
-            vae=vae,
-            transformer=transformer,
-            scheduler_template=noise_scheduler_copy,
-            pixel_values=pv,
-            subject_pixel_values=subj,
-            cond_pixel_values=cond,
-            prompt_embeds=pe,
-            text_ids=tid,
-            guidance_scale=float(ns.guidance_scale),
-            weight_dtype=weight_dtype,
-            device=device,
-            num_inference_steps=int(ns.num_inference_steps),
-            generator=gen,
+    def _lora_weighter(step_i: int, n_steps: int) -> None:
+        ast = min(max(float(ns.lora_interval_appearance_strength), 0.0), 1.5)
+        n_depth = int(ns.lora_first_depth_steps)
+        if n_depth > 0:
+            if step_i < n_depth:
+                wc, wd = 0.2, 1.0
+            else:
+                wc, wd = 1.0, 0.1
+            lora_w[0], lora_w[1] = wc * ast, wd
+            return
+        denom = max(1, n_steps - 1)
+        frac = float(step_i) / float(denom)
+        wc, wd = _lora_interval_w_canvas_depth(
+            frac,
+            t1=float(ns.lora_interval_t1),
+            t2=float(ns.lora_interval_t2),
+            t3=float(ns.lora_interval_t3),
+            tail=float(ns.lora_interval_tail),
         )
+        lora_w[0], lora_w[1] = wc * ast, wd
 
-    outp = Path(ns.output).expanduser().resolve()
-    outp.parent.mkdir(parents=True, exist_ok=True)
-    out_pil.save(outp)
-    print(f"Saved → {outp}")
-    with open(outp.with_suffix(".txt"), "w", encoding="utf-8") as f:
-        f.write(scene_prompt)
+    def _run_denoise(subj: torch.Tensor, cond: torch.Tensor) -> Image.Image:
+        gen = torch.Generator(device=device).manual_seed(int(ns.seed))
+        with torch.inference_mode():
+            return _denoise_one(
+                vae=vae,
+                transformer=transformer,
+                scheduler_template=noise_scheduler_copy,
+                pixel_values=pv,
+                subject_pixel_values=subj,
+                cond_pixel_values=cond,
+                prompt_embeds=pe,
+                text_ids=tid,
+                guidance_scale=float(ns.guidance_scale),
+                weight_dtype=weight_dtype,
+                device=device,
+                num_inference_steps=int(ns.num_inference_steps),
+                generator=gen,
+                lora_weighter=_lora_weighter if lora_limited_schedule else None,
+            )
+
+    out_base = Path(ns.output).expanduser().resolve()
+    out_base.parent.mkdir(parents=True, exist_ok=True)
+
+    if ns.cond_variants:
+        variants: list[tuple[str, torch.Tensor, torch.Tensor]] = [
+            ("depth_black", subj_full, black_t),
+            ("canvas_black", black_t, cond_full),
+            ("both", subj_full, cond_full),
+        ]
+        for name, subj, cond in variants:
+            out_pil = _run_denoise(subj, cond)
+            outp = out_base.with_name(f"{out_base.stem}_{name}{out_base.suffix}")
+            out_pil.save(outp)
+            print(f"Saved ({name}) → {outp}")
+            with open(outp.with_suffix(".txt"), "w", encoding="utf-8") as f:
+                f.write(scene_prompt)
+    else:
+        out_pil = _run_denoise(subj_full, cond_full)
+        out_pil.save(out_base)
+        print(f"Saved → {out_base}")
+        with open(out_base.with_suffix(".txt"), "w", encoding="utf-8") as f:
+            f.write(scene_prompt)
 
 
 if __name__ == "__main__":

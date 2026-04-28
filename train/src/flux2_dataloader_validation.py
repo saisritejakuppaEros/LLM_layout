@@ -13,7 +13,7 @@ import json
 import os
 import time
 from argparse import Namespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -206,6 +206,7 @@ def _denoise_one(
     device: torch.device,
     num_inference_steps: int,
     generator: Optional[torch.Generator],
+    lora_weighter: Optional[Callable[[int, int], None]] = None,
 ) -> Image.Image:
     """Cond-aware denoise matching training (`cond_hidden_states` + joint `img_ids`)."""
     infer_scheduler = copy.deepcopy(scheduler_template)
@@ -243,7 +244,10 @@ def _denoise_one(
 
     guidance = torch.full((1,), guidance_scale, device=device, dtype=torch.float32)
 
-    for t in timesteps:
+    n_steps = len(timesteps)
+    for step_idx, t in enumerate(timesteps):
+        if lora_weighter is not None:
+            lora_weighter(int(step_idx), n_steps)
         timestep = t.expand(latents.shape[0]).to(latents.dtype)
         noise_pred = transformer(
             hidden_states=latents.to(transformer.dtype),

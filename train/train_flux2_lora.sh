@@ -4,14 +4,14 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 MODEL_DIR="/mnt/data0/teja/research_multiref/llm_based_layout/models/models--black-forest-labs--FLUX.2-dev/snapshots/26afe3a78bb242c0a8bb181dcc8937bb16e5c66c"
-CSV_PATH="/mnt/data0/teja/research_multiref/dataset_preparation/output/bbox_results/yolo26_detections.csv"
-CANVAS_IMAGE_ROOT="/mnt/data0/teja/research_multiref/dataset_preparation/output/images"
-DEPTH_IMAGE_ROOT="/mnt/data0/teja/research_multiref/dataset_preparation/output/depth"
+CSV_PATH="/mnt/data0/teja/research_multiref/lora_training_v2/dataset_prep_v2/output/bbox_results/yolo26_detections.csv"
+CANVAS_IMAGE_ROOT="/mnt/data0/teja/research_multiref/lora_training_v2/dataset_prep_v2/output/images"
+DEPTH_IMAGE_ROOT="/mnt/data0/teja/research_multiref/lora_training_v2/dataset_prep_v2/output/depth"
 # Per-sample prob to keep real depth / canvas (else black cond). Override: DEPTH_KEEP_PROB=1 CANVAS_KEEP_PROB=1 ./train_flux2_lora.sh
 DEPTH_KEEP_PROB="${DEPTH_KEEP_PROB:-0.5}"
 CANVAS_KEEP_PROB="${CANVAS_KEEP_PROB:-0.5}"
-CAPTION_DIR="/mnt/data0/teja/research_multiref/dataset_preparation/output/image_captions"
-MULTIVIEW_DIR="/mnt/data0/teja/research_multiref/dataset_preparation/output/multiview_out"
+CAPTION_DIR="/mnt/data0/teja/research_multiref/lora_training_v2/dataset_prep_v2/output/image_captions"
+MULTIVIEW_DIR="/mnt/data0/teja/research_multiref/lora_training_v2/dataset_prep_v2/output/multiview_out"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT_DIR="$SCRIPT_DIR/output/lora_checkpoints_v2"
 
