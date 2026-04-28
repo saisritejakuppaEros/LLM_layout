@@ -13,6 +13,7 @@ from safetensors.torch import save_file
 import numpy as np
 import torch
 import torch.utils.checkpoint
+from torch.utils.data import WeightedRandomSampler
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -38,7 +39,15 @@ from diffusers.utils import check_min_version
 from src.prompt_helper import encode_prompts_flux2
 from src.transformer_flux import FluxTransformer2DModel
 from src.jsonl_datasets import make_train_dataset, collate_fn, multiple_16
-from src.canvas_dataset import collate_fn_canvas, log_canvas_asset_pairing_report, make_canvas_train_dataset
+from src.canvas_dataset import (
+    CANVAS_DATA_ROOT_CSV,
+    balanced_sampling_weights_for_concat,
+    collate_fn_canvas,
+    concat_dataset_child_lengths,
+    log_canvas_asset_pairing_report,
+    make_canvas_train_dataset,
+    parse_canvas_data_roots,
+)
 from src.layers_flux2 import MultiDoubleStreamBlockFlux2LoraProcessor, MultiSingleStreamBlockFlux2LoraProcessor
 from src.flux2_train_helpers import encode_flux2_latents, prepare_subject_latent_ids, unpack_main_latents
 
@@ -207,7 +216,32 @@ def parse_args(input_args=None):
         "--csv_path",
         type=str,
         default="",
-        help="Used when dataset_type=canvas: CSV with columns image_path, prompt (and optional bbox columns).",
+        help="Used when dataset_type=canvas: CSV with columns image_path, prompt (and optional bbox columns). "
+        "Ignored when --canvas_data_roots is non-empty (paths are derived per root).",
+    )
+    parser.add_argument(
+        "--canvas_data_roots",
+        type=str,
+        default="",
+        help=(
+            "When dataset_type=canvas and non-empty: comma/semicolon/newline-separated list of dataset **output** "
+            "directories. Each must contain bbox_results/yolo26_detections.csv, images/, depth/, image_captions/, "
+            "and multiview_out/ (same layout as dataset_prep output). Builds one CanvasSceneDataset per root and "
+            "concatenates them. With multiple roots, default training uses a balanced sampler (equal P per root); "
+            "see --canvas_balanced_concat_sampling."
+        ),
+    )
+    parser.add_argument(
+        "--canvas_balanced_concat_sampling",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When the canvas dataset is a ConcatDataset from multiple --canvas_data_roots: use "
+            "WeightedRandomSampler so each root is drawn with equal probability (e.g. half from each of two roots) "
+            "even if CSV lengths differ (5k vs 50k). Single-process training only; with DDP (num_processes>1) "
+            "this is skipped and shuffle=True is used. --no-canvas_balanced_concat_sampling restores "
+            "length-proportional sampling (shuffle)."
+        ),
     )
     parser.add_argument(
         "--canvas_column",
@@ -263,6 +297,35 @@ def parse_args(input_args=None):
             "with a black canvas in model space (same tensor shape, values -1). Use 1.0 to disable. "
             "Dataloader validation forces 1.0 while sampling for clearer PNGs."
         ),
+    )
+    parser.add_argument(
+        "--canvas_depth_coarse_augment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When dataset uses depth: during training only, randomly degrade kept depth (large Gaussian blur, "
+            "additive noise, smoothed patch dropout) so fine appearance must come from the canvas; full-depth "
+            "dropout remains controlled by --depth_keep_prob. Off when validation disables canvas aug or when "
+            "--no-canvas_augment."
+        ),
+    )
+    parser.add_argument(
+        "--canvas_depth_coarse_blur_prob",
+        type=float,
+        default=0.7,
+        help="Training-only: probability to apply heavy Gaussian blur to depth (per sample).",
+    )
+    parser.add_argument(
+        "--canvas_depth_coarse_noise_prob",
+        type=float,
+        default=0.4,
+        help="Training-only: probability to add Gaussian noise to depth in [0,1] space (per sample).",
+    )
+    parser.add_argument(
+        "--canvas_depth_coarse_patch_prob",
+        type=float,
+        default=0.3,
+        help="Training-only: probability for smoothed multiplicative patch dropout on depth (per sample).",
     )
     parser.add_argument(
         "--caption_dir",
@@ -603,6 +666,16 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
+        "--validation_depth_coarse_augment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When canvas aug is off for validation (--no-validation_canvas_augment), still apply depth blur/noise/"
+            "patch dropout if True (default), matching stage3 inference. Use --no-validation_depth_coarse_augment "
+            "for clean depth PNGs in validation."
+        ),
+    )
+    parser.add_argument(
         "--text_encoder_out_layers",
         type=int,
         nargs="+",
@@ -885,12 +958,19 @@ def main(args):
         f"mixed_precision={args.mixed_precision} guidance_scale={args.guidance_scale}"
     )
     if args.dataset_type == "canvas":
-        _log_train(
-            f"canvas paths: csv={args.csv_path!r} "
-            f"canvas_image_root={getattr(args, 'canvas_image_root', '')!r} "
-            f"depth_image_root={getattr(args, 'depth_image_root', '')!r} "
-            f"caption_dir={getattr(args, 'caption_dir', '')!r}"
-        )
+        _merged_roots = parse_canvas_data_roots(getattr(args, "canvas_data_roots", None) or "")
+        if _merged_roots:
+            _log_train(
+                f"canvas merged data roots ({len(_merged_roots)}): {_merged_roots!r} — per root: "
+                "bbox_results/yolo26_detections.csv, images/, depth/, image_captions/, multiview_out/"
+            )
+        else:
+            _log_train(
+                f"canvas paths: csv={args.csv_path!r} "
+                f"canvas_image_root={getattr(args, 'canvas_image_root', '')!r} "
+                f"depth_image_root={getattr(args, 'depth_image_root', '')!r} "
+                f"caption_dir={getattr(args, 'caption_dir', '')!r}"
+            )
 
     if torch.backends.mps.is_available() and args.mixed_precision == "bf16":
         # due to pytorch#99272, MPS does not yet support bfloat16.
@@ -912,7 +992,10 @@ def main(args):
         args.unified_train_width = multiple_16(args.unified_train_width)
         args.unified_train_height = multiple_16(args.unified_train_height)
 
-    if args.dataset_type == "canvas" and (getattr(args, "depth_image_root", "") or "").strip():
+    _canvas_data_roots_for_depth = parse_canvas_data_roots(getattr(args, "canvas_data_roots", None) or "")
+    if args.dataset_type == "canvas" and (
+        (getattr(args, "depth_image_root", "") or "").strip() or _canvas_data_roots_for_depth
+    ):
         if args.lora_num < 2:
             logger.info(
                 "depth_image_root is set: using lora_num=2 for canvas + depth conditioning blocks (was %s).",
@@ -1167,11 +1250,32 @@ def main(args):
     _train_lz(accelerator, "optimizer ready")
 
     if args.dataset_type == "canvas":
-        if not args.csv_path:
-            raise ValueError("dataset_type=canvas requires --csv_path")
+        _roots = parse_canvas_data_roots(getattr(args, "canvas_data_roots", None) or "")
+        if not _roots and not args.csv_path:
+            raise ValueError(
+                "dataset_type=canvas requires --csv_path or non-empty --canvas_data_roots "
+                "(comma-separated output directories)."
+            )
         _train_lz(accelerator, "canvas asset pairing report (images / depth / captions by stem)")
-        log_canvas_asset_pairing_report(args)
-        _train_lz(accelerator, "building canvas train dataset")
+        if _roots:
+            for root_s in _roots:
+                r = Path(root_s).expanduser().resolve()
+                sub_args = copy.copy(args)
+                sub_args.csv_path = str(r / CANVAS_DATA_ROOT_CSV)
+                sub_args.canvas_image_root = str(r / "images")
+                sub_args.depth_image_root = str(r / "depth")
+                sub_args.caption_dir = str(r / "image_captions")
+                sub_args.canvas_multiview_dir = str(r / "multiview_out")
+                log_canvas_asset_pairing_report(sub_args)
+            _train_lz(
+                accelerator,
+                f"building merged canvas train dataset ({len(_roots)} root(s); "
+                f"balanced per-root sampling={'on' if getattr(args, 'canvas_balanced_concat_sampling', True) else 'off'} "
+                f"when num_processes==1)",
+            )
+        else:
+            log_canvas_asset_pairing_report(args)
+            _train_lz(accelerator, "building canvas train dataset")
         train_dataset = make_canvas_train_dataset(args, accelerator)
         cfn = collate_fn_canvas
         if not args.canvas_random_target_resolution:
@@ -1194,13 +1298,53 @@ def main(args):
         cfn = collate_fn
     _train_lz(accelerator, f"dataset built: len={len(train_dataset)}")
 
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=args.train_batch_size,
-        shuffle=True,
-        collate_fn=cfn,
-        num_workers=args.dataloader_num_workers,
+    _concat_lens = concat_dataset_child_lengths(train_dataset)
+    _use_balanced = (
+        args.dataset_type == "canvas"
+        and getattr(args, "canvas_balanced_concat_sampling", True)
+        and _concat_lens is not None
+        and accelerator.num_processes == 1
     )
+    if (
+        args.dataset_type == "canvas"
+        and getattr(args, "canvas_balanced_concat_sampling", True)
+        and _concat_lens is not None
+        and accelerator.num_processes > 1
+    ):
+        _train_lz(
+            accelerator,
+            "canvas_balanced_concat_sampling is disabled when num_processes>1 (fallback: shuffle=True); "
+            "run single-GPU to balance unequal concat roots.",
+        )
+
+    _dl_kwargs: dict = {
+        "dataset": train_dataset,
+        "batch_size": args.train_batch_size,
+        "collate_fn": cfn,
+        "num_workers": args.dataloader_num_workers,
+    }
+    if _use_balanced:
+        _w = balanced_sampling_weights_for_concat(train_dataset)
+        _g = torch.Generator()
+        if args.seed is not None:
+            _g.manual_seed(int(args.seed))
+        _sampler = WeightedRandomSampler(
+            weights=_w,
+            num_samples=len(train_dataset),
+            replacement=True,
+            generator=_g,
+        )
+        _dl_kwargs["sampler"] = _sampler
+        _dl_kwargs["shuffle"] = False
+        _train_lz(
+            accelerator,
+            f"DataLoader: WeightedRandomSampler (balanced roots), child lengths={_concat_lens}, "
+            f"num_samples/epoch={len(train_dataset)}",
+        )
+    else:
+        _dl_kwargs["shuffle"] = True
+
+    train_dataloader = torch.utils.data.DataLoader(**_dl_kwargs)
     _train_lz(
         accelerator,
         f"DataLoader ready (batch_size={args.train_batch_size}, num_workers={args.dataloader_num_workers})",

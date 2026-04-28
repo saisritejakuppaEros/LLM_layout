@@ -2,6 +2,9 @@
 """
 Stage 3: FLUX.2 + trained canvas/depth LoRA inference (same denoise path as training validation).
 
+Depth is degraded by default (blur / noise / patch dropout) to match ``train.py`` canvas training — use
+``--no-canvas_depth_coarse_augment`` for a sharp depth map.
+
 Expects the same layout as ``train_flux2_lora.sh``: ``lora_num=2``, unified H×W, ``ranks`` / ``network_alphas``.
 
 Default paths match your pipeline; override with flags or env.
@@ -53,7 +56,12 @@ for _p in (_TRAIN_DIR, _INFER_DIR):
 DEFAULT_SCENE_PROMPT  = """
 A clean, well-composed scene featuring an exotic candle stand with no candle, a transparent drinking glass, a classic glass Coca-Cola bottle, a table with four legs, a Nilkamal-style plastic chair, a generic adult person standing casually with hand folding hands, and a ceiling fan above. The objects are arranged naturally with good spacing and realistic proportions, with smaller items like the candle stand, glass, and bottle placed on the table. Soft lighting, minimal and realistic style.""".strip()
 
-from src.canvas_dataset import load_depth_image_as_rgb_pil, pil_to_model_tensor, resize_cover_pil  # noqa: E402
+from src.canvas_dataset import (  # noqa: E402
+    coarse_degrade_depth_rgb_pil,
+    load_depth_image_as_rgb_pil,
+    pil_to_model_tensor,
+    resize_cover_pil,
+)
 from src.flux2_dataloader_validation import _denoise_one  # noqa: E402
 from src.jsonl_datasets import multiple_16  # noqa: E402
 from src.layers_flux2 import MultiDoubleStreamBlockFlux2LoraProcessor, MultiSingleStreamBlockFlux2LoraProcessor  # noqa: E402
@@ -189,6 +197,33 @@ def main() -> None:
     p.add_argument("--canvas_image", type=str, default=_DEFAULT_CANVAS)
     p.add_argument("--depth_image", type=str, default=_DEFAULT_DEPTH)
     p.add_argument(
+        "--canvas_depth_coarse_augment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Match training: randomly degrade resized depth (Gaussian blur, noise, smoothed patch dropout) "
+            "before VAE encode. Use --no-canvas_depth_coarse_augment for a clean depth map."
+        ),
+    )
+    p.add_argument(
+        "--canvas_depth_coarse_blur_prob",
+        type=float,
+        default=0.7,
+        help="Per forward pass: probability to apply heavy blur to depth (same default as train.py).",
+    )
+    p.add_argument(
+        "--canvas_depth_coarse_noise_prob",
+        type=float,
+        default=0.4,
+        help="Per forward pass: probability to add Gaussian noise to depth.",
+    )
+    p.add_argument(
+        "--canvas_depth_coarse_patch_prob",
+        type=float,
+        default=0.3,
+        help="Per forward pass: probability for smoothed patch dropout on depth.",
+    )
+    p.add_argument(
         "--prompt",
         type=str,
         default="",
@@ -307,6 +342,9 @@ def main() -> None:
 
         canvas_u = resize_contain_letterbox_pil(canvas_pil, tw, th)
         depth_u = resize_contain_letterbox_pil(depth_pil, tw, th)
+
+    if ns.canvas_depth_coarse_augment:
+        depth_u = coarse_degrade_depth_rgb_pil(depth_u, ns)
 
     if ns.target_init == "canvas":
         target_u = canvas_u.copy()

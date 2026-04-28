@@ -4,14 +4,17 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 MODEL_DIR="/mnt/data0/teja/research_multiref/llm_based_layout/models/models--black-forest-labs--FLUX.2-dev/snapshots/26afe3a78bb242c0a8bb181dcc8937bb16e5c66c"
-CSV_PATH="/mnt/data0/teja/research_multiref/lora_training_v2/dataset_prep_v2/output/bbox_results/yolo26_detections.csv"
-CANVAS_IMAGE_ROOT="/mnt/data0/teja/research_multiref/lora_training_v2/dataset_prep_v2/output/images"
-DEPTH_IMAGE_ROOT="/mnt/data0/teja/research_multiref/lora_training_v2/dataset_prep_v2/output/depth"
-# Per-sample prob to keep real depth / canvas (else black cond). Override: DEPTH_KEEP_PROB=1 CANVAS_KEEP_PROB=1 ./train_flux2_lora.sh
+
+# Two dataset output trees. Under each, train.py expects (defaults):
+#   bbox_results/yolo26_detections.csv  images/  depth/  image_captions/  multiview_out/
+CANVAS_DATA_ROOT_1="${CANVAS_DATA_ROOT_1:-/mnt/data0/teja/research_multiref/lora_training_v2/dataset_prep_v2/output}"
+CANVAS_DATA_ROOT_2="${CANVAS_DATA_ROOT_2:-/mnt/data0/teja/research_multiref/dataset_preparation/output}"
+# Override with a full comma-separated list if you prefer: CANVAS_DATA_ROOTS="a,b" ./train_flux2_lora.sh
+CANVAS_DATA_ROOTS="${CANVAS_DATA_ROOTS:-${CANVAS_DATA_ROOT_1},${CANVAS_DATA_ROOT_2}}"
+
 DEPTH_KEEP_PROB="${DEPTH_KEEP_PROB:-0.5}"
 CANVAS_KEEP_PROB="${CANVAS_KEEP_PROB:-0.5}"
-CAPTION_DIR="/mnt/data0/teja/research_multiref/lora_training_v2/dataset_prep_v2/output/image_captions"
-MULTIVIEW_DIR="/mnt/data0/teja/research_multiref/lora_training_v2/dataset_prep_v2/output/multiview_out"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT_DIR="$SCRIPT_DIR/output/lora_checkpoints_v2"
 
@@ -20,21 +23,17 @@ mkdir -p "$OUTPUT_DIR" "$OUTPUT_DIR/logs"
 COMMON_ARGS=(
   --pretrained_model_name_or_path "$MODEL_DIR"
   --dataset_type canvas
-  --csv_path "$CSV_PATH"
-  --canvas_image_root "$CANVAS_IMAGE_ROOT"
-  --depth_image_root "$DEPTH_IMAGE_ROOT"
+  --canvas_data_roots "$CANVAS_DATA_ROOTS"
   --depth_keep_prob "$DEPTH_KEEP_PROB"
   --canvas_keep_prob "$CANVAS_KEEP_PROB"
   --canvas_conditioning bbox_multiview
   --canvas_bbox_min_side 0
   --canvas_multiview_match_min_side 200
-  --canvas_multiview_dir "$MULTIVIEW_DIR"
   --canvas_multiview_prob 0.5
   --canvas_background black
   --canvas_column canvas_path
   --canvas_target_column image_path
   --canvas_prompt_column prompt
-  --caption_dir "$CAPTION_DIR"
   --prompt_warmup_steps 500
   --spatial_column None
   --cond_size 512

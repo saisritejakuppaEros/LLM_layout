@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import re
 import warnings
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 from PIL import Image
 from torchvision import transforms
+import torchvision.transforms.functional as TVF
 
 from .canvas_bbox_compose import (
     CANVAS_H,
@@ -25,6 +27,85 @@ from .canvas_bbox_compose import (
 from .jsonl_datasets import get_random_resolution, load_image_safely, multiple_16
 
 Image.MAX_IMAGE_PIXELS = None
+
+# Relative layout under each ``--canvas_data_roots`` entry (same as dataset_prep output trees).
+CANVAS_DATA_ROOT_CSV = Path("bbox_results") / "yolo26_detections.csv"
+
+
+def parse_canvas_data_roots(raw: Optional[str]) -> List[str]:
+    """Split ``--canvas_data_roots`` (comma/semicolon/newline separated) into non-empty absolute or relative roots."""
+    if raw is None:
+        return []
+    s = str(raw).strip()
+    if not s:
+        return []
+    return [p.strip() for p in re.split(r"[\n,;]+", s) if p.strip()]
+
+
+def resolve_canvas_data_paths(root: Path) -> Dict[str, Path]:
+    """Paths under one dataset ``output`` root for merged training."""
+    root = root.expanduser().resolve()
+    return {
+        "csv": root / CANVAS_DATA_ROOT_CSV,
+        "images": root / "images",
+        "depth": root / "depth",
+        "captions": root / "image_captions",
+        "multiview": root / "multiview_out",
+    }
+
+
+class CanvasConcatDataset(torch.utils.data.ConcatDataset):
+    """Multiple ``CanvasSceneDataset`` roots; proxies validation toggles to every child."""
+
+    _PROXY_ATTRS = frozenset({"_canvas_augment_enabled", "_depth_keep_prob", "_canvas_keep_prob"})
+
+    def __init__(self, datasets: List["CanvasSceneDataset"]):
+        object.__setattr__(self, "_canvas_children", list(datasets))
+        super().__init__(datasets)
+
+    def __getattr__(self, name: str) -> Any:
+        if name in CanvasConcatDataset._PROXY_ATTRS:
+            ch = object.__getattribute__(self, "_canvas_children")
+            if not ch:
+                raise AttributeError(name)
+            return getattr(ch[0], name)
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in CanvasConcatDataset._PROXY_ATTRS and hasattr(self, "_canvas_children"):
+            for ds in object.__getattribute__(self, "_canvas_children"):
+                setattr(ds, name, value)
+            return
+        super().__setattr__(name, value)
+
+
+def concat_dataset_child_lengths(ds: torch.utils.data.Dataset) -> Optional[list[int]]:
+    """If ``ds`` is a multi-child :class:`torch.utils.data.ConcatDataset`, return ``[len(c) for c in ds.datasets]``."""
+    if not isinstance(ds, torch.utils.data.ConcatDataset):
+        return None
+    parts = getattr(ds, "datasets", None) or []
+    if len(parts) < 2:
+        return None
+    return [len(c) for c in parts]
+
+
+def balanced_sampling_weights_for_concat(ds: torch.utils.data.ConcatDataset) -> torch.Tensor:
+    """Weights for :class:`torch.utils.data.WeightedRandomSampler`: each concat child is chosen with probability ``1/k``.
+
+    Child ``j`` has ``n_j`` indices; each gets weight ``1/n_j`` so the total mass on child ``j`` is ``n_j * (1/n_j) = 1``,
+    normalized against ``k`` children gives equal root probability.
+    """
+    lengths = concat_dataset_child_lengths(ds)
+    if lengths is None:
+        raise ValueError("balanced_sampling_weights_for_concat expects a ConcatDataset with at least two children")
+    weights: list[float] = []
+    for n in lengths:
+        if n <= 0:
+            raise ValueError("balanced_sampling_weights_for_concat: empty child dataset")
+        weights.extend([1.0 / float(n)] * n)
+    if len(weights) != len(ds):
+        raise RuntimeError("internal: weight length != concat dataset length")
+    return torch.tensor(weights, dtype=torch.double)
 
 
 def resolve_depth_asset_path(depth_root: Path, rel: str) -> Optional[Path]:
@@ -308,6 +389,59 @@ def load_depth_image_as_rgb_pil(path: Path | str) -> Image.Image:
     return Image.fromarray(rgb, mode="RGB")
 
 
+def _clamp_odd_blur_kernel(k: int, w: int, h: int) -> int:
+    """Largest odd kernel ≤ min(k, w, h), at least 3, or 0 if the map is too small to blur."""
+    cap = int(min(w, h))
+    if cap < 3:
+        return 0
+    mk = int(min(k, cap))
+    if mk < 3:
+        return 0
+    if mk % 2 == 0:
+        mk -= 1
+    return mk if mk >= 3 else 0
+
+
+def coarse_degrade_depth_rgb_pil(depth_rgb: Image.Image, args: Any) -> Image.Image:
+    """Blur / noise / soft patch dropout in [0,1] space — encourages using canvas for fine appearance.
+
+    Used when ``CanvasSceneDataset._depth_coarse_augment_active`` is true (training batches and, if enabled,
+    validation / inference scripts that pass the same ``args`` fields).
+    """
+    w, h = depth_rgb.size
+    arr = np.asarray(depth_rgb.convert("RGB"), dtype=np.float32) * (1.0 / 255.0)
+    t = torch.from_numpy(arr).permute(2, 0, 1)
+
+    p_blur = float(getattr(args, "canvas_depth_coarse_blur_prob", 0.7))
+    if float(np.random.random()) < p_blur:
+        kernels = tuple(getattr(args, "canvas_depth_coarse_blur_kernels", (11, 15, 21, 31, 41)))
+        k = int(np.random.choice(kernels))
+        k = _clamp_odd_blur_kernel(k, w, h)
+        if k >= 3:
+            sigma = max(0.15, float(k) / 6.0)
+            t = TVF.gaussian_blur(t, kernel_size=[k, k], sigma=[sigma, sigma])
+
+    p_noise = float(getattr(args, "canvas_depth_coarse_noise_prob", 0.4))
+    if float(np.random.random()) < p_noise:
+        lo = float(getattr(args, "canvas_depth_coarse_noise_std_lo", 0.03))
+        hi = float(getattr(args, "canvas_depth_coarse_noise_std_hi", 0.10))
+        scale = float(np.random.uniform(lo, hi))
+        t = (t + torch.randn_like(t) * scale).clamp(0.0, 1.0)
+
+    p_patch = float(getattr(args, "canvas_depth_coarse_patch_prob", 0.3))
+    if float(np.random.random()) < p_patch:
+        drop_p = float(getattr(args, "canvas_depth_coarse_patch_drop_strength", 0.3))
+        m = torch.bernoulli(torch.full((1, 1, h, w), 1.0 - drop_p, dtype=t.dtype))
+        mk = _clamp_odd_blur_kernel(21, w, h)
+        if mk >= 3:
+            sig = max(1.0, float(mk) / 6.0)
+            m = TVF.gaussian_blur(m, kernel_size=[mk, mk], sigma=[sig, sig])
+        t = t * m.squeeze(0)
+
+    u8 = (t.clamp(0.0, 1.0).mul(255.0).round().byte().permute(1, 2, 0).cpu().numpy())
+    return Image.fromarray(np.asarray(u8), mode="RGB")
+
+
 def _make_subject_transform(cond_size: int, *, random_geom_aug: bool) -> transforms.Compose:
     """Resize (long side → cond_size, /16), optional flip/small rotate, square pad, [-1,1] tensor."""
     steps: List[Any] = [
@@ -373,14 +507,23 @@ class CanvasSceneDataset(torch.utils.data.Dataset):
         canvas_column: str = "canvas_path",
         target_column: str = "image_path",
         prompt_column: str = "prompt",
+        *,
+        asset_image_root: Optional[str] = None,
+        asset_depth_root: Optional[str] = None,
+        asset_caption_root: Optional[str] = None,
+        asset_multiview_root: Optional[str] = None,
     ):
         super().__init__()
         self.args = args
         self.canvas_column = canvas_column
         self.target_column = target_column
         self.prompt_column = prompt_column
-        root = getattr(args, "canvas_image_root", None)
-        self._image_root = root.strip() if isinstance(root, str) and root.strip() else None
+        img_src = (
+            asset_image_root
+            if asset_image_root is not None
+            else getattr(args, "canvas_image_root", None)
+        )
+        self._image_root = img_src.strip() if isinstance(img_src, str) and img_src.strip() else None
         self.conditioning = getattr(args, "canvas_conditioning", "precomputed")
 
         with open(csv_path, newline="", encoding="utf-8") as f:
@@ -405,8 +548,12 @@ class CanvasSceneDataset(torch.utils.data.Dataset):
         self.subject_transform_layout_preserving = _make_subject_transform(size, random_geom_aug=False)
 
         if self.conditioning == "bbox_multiview":
-            mv = getattr(args, "canvas_multiview_dir", "") or ""
-            self._multiview_root = Path(mv).resolve() if mv.strip() else None
+            mv_raw = (
+                asset_multiview_root
+                if asset_multiview_root is not None
+                else (getattr(args, "canvas_multiview_dir", "") or "")
+            )
+            self._multiview_root = Path(mv_raw).resolve() if isinstance(mv_raw, str) and mv_raw.strip() else None
             if self._multiview_root is not None and not self._multiview_root.is_dir():
                 self._multiview_root = None
             self._multiview_prob = float(getattr(args, "canvas_multiview_prob", 0.5))
@@ -418,8 +565,12 @@ class CanvasSceneDataset(torch.utils.data.Dataset):
             else:
                 self._compose_canvas_wh = (CANVAS_W, CANVAS_H)
             self._canvas_augment_enabled = True
-            dr = getattr(args, "depth_image_root", None) or ""
-            self._depth_root: Optional[Path] = Path(dr).resolve() if dr.strip() else None
+            dr = (
+                asset_depth_root
+                if asset_depth_root is not None
+                else (getattr(args, "depth_image_root", None) or "")
+            )
+            self._depth_root: Optional[Path] = Path(dr).resolve() if isinstance(dr, str) and dr.strip() else None
             if self._depth_root is not None and not self._depth_root.is_dir():
                 raise ValueError(f"depth_image_root is not a directory: {self._depth_root}")
             self.groups: List[Tuple[str, List[Dict[str, Any]]]] = prepare_groups_from_flat_rows(
@@ -439,8 +590,12 @@ class CanvasSceneDataset(torch.utils.data.Dataset):
             self._multiview_root = None
             self._compose_canvas_wh = (CANVAS_W, CANVAS_H)
             self._canvas_augment_enabled = True
-            dr = getattr(args, "depth_image_root", None) or ""
-            self._depth_root = Path(dr).resolve() if dr.strip() else None
+            dr = (
+                asset_depth_root
+                if asset_depth_root is not None
+                else (getattr(args, "depth_image_root", None) or "")
+            )
+            self._depth_root = Path(dr).resolve() if isinstance(dr, str) and dr.strip() else None
             if self._depth_root is not None and not self._depth_root.is_dir():
                 raise ValueError(f"depth_image_root is not a directory: {self._depth_root}")
 
@@ -457,7 +612,9 @@ class CanvasSceneDataset(torch.utils.data.Dataset):
         if not (0.0 <= self._canvas_keep_prob <= 1.0):
             raise ValueError(f"canvas_keep_prob must be in [0, 1], got {self._canvas_keep_prob}")
 
-        cap = getattr(args, "caption_dir", None)
+        self._depth_coarse_augment = bool(getattr(args, "canvas_depth_coarse_augment", True))
+
+        cap = asset_caption_root if asset_caption_root is not None else getattr(args, "caption_dir", None)
         self._caption_root: Optional[Path] = None
         if isinstance(cap, str) and cap.strip():
             self._caption_root = Path(cap).resolve()
@@ -553,8 +710,8 @@ class CanvasSceneDataset(torch.utils.data.Dataset):
             return None
         return resolve_depth_asset_path(self._depth_root, rel)
 
-    def _maybe_depth_for_rel(self, rel: str, tw: int, th: int) -> Optional[Image.Image]:
-        """Same basename/stem as ``rel``; **center-crop** to ``tw×th`` (matches target — no letterbox bars)."""
+    def _load_depth_crop_pil_with_flag(self, rel: str, tw: int, th: int) -> Optional[Tuple[Image.Image, bool]]:
+        """Load depth, center-crop to ``tw×th``. Returns ``(pil, from_disk)`` or ``None`` if depth stream disabled."""
         if self._depth_root is None:
             return None
         p = self._resolve_depth_path(rel)
@@ -567,9 +724,30 @@ class CanvasSceneDataset(torch.utils.data.Dataset):
                     f"using a black placeholder.",
                     stacklevel=2,
                 )
-            return Image.new("RGB", (tw, th), (0, 0, 0))
+            return (Image.new("RGB", (tw, th), (0, 0, 0)), False)
         depth = load_depth_image_as_rgb_pil(p)
-        return resize_cover_pil(depth, tw, th)
+        return (resize_cover_pil(depth, tw, th), True)
+
+    def _depth_coarse_augment_active(self) -> bool:
+        """Depth degradation: on for normal training batches; also on in validation when canvas aug is off if
+        ``args.validation_depth_coarse_augment`` (default True) so depth matches inference/stage3."""
+        if not self._depth_coarse_augment:
+            return False
+        if not getattr(self.args, "canvas_augment", True):
+            return False
+        if getattr(self, "_canvas_augment_enabled", True):
+            return True
+        return bool(getattr(self.args, "validation_depth_coarse_augment", True))
+
+    def _prepare_depth_for_sample(self, rel: str, tw: int, th: int) -> Optional[Image.Image]:
+        """Load depth → optional coarse degradation → ``_depth_keep_prob`` full dropout."""
+        pack = self._load_depth_crop_pil_with_flag(rel, tw, th)
+        if pack is None:
+            return None
+        depth_pil, from_disk = pack
+        if from_disk and self._depth_coarse_augment_active():
+            depth_pil = coarse_degrade_depth_rgb_pil(depth_pil, self.args)
+        return self._finalize_depth_cond(depth_pil, tw, th)
 
     def _finalize_depth_cond(self, depth_pil: Image.Image, tw: int, th: int) -> Image.Image:
         """Stochastic depth: keep real map with ``_depth_keep_prob``, else black RGB (same size as target crop)."""
@@ -627,9 +805,7 @@ class CanvasSceneDataset(torch.utils.data.Dataset):
 
             pixel_values = pil_to_model_tensor(cropped_full)
             subject_pixel_values = self._finalize_subject_pixel_tensor(pil_to_model_tensor(canvas_pil))
-            depth_u = self._maybe_depth_for_rel(rel, tw, th)
-            if depth_u is not None:
-                depth_u = self._finalize_depth_cond(depth_u, tw, th)
+            depth_u = self._prepare_depth_for_sample(rel, tw, th)
         else:
             canvas_pil = build_canvas_for_image_rel(
                 rel,
@@ -674,9 +850,7 @@ class CanvasSceneDataset(torch.utils.data.Dataset):
         if self._unified_wh is not None:
             tw, th = self._unified_wh
             tgt_u = resize_cover_pil(target.convert("RGB"), tw, th)
-            depth_u_for_cond = self._maybe_depth_for_rel(rel, tw, th)
-            if depth_u_for_cond is not None:
-                depth_u_for_cond = self._finalize_depth_cond(depth_u_for_cond, tw, th)
+            depth_u_for_cond = self._prepare_depth_for_sample(rel, tw, th)
             pixel_values = pil_to_model_tensor(tgt_u)
         else:
             noise_size = get_random_resolution(max_size=self.args.noise_size)
@@ -712,14 +886,40 @@ class CanvasSceneDataset(torch.utils.data.Dataset):
 
 
 def make_canvas_train_dataset(args, accelerator=None):
-    ds = CanvasSceneDataset(
+    roots = parse_canvas_data_roots(getattr(args, "canvas_data_roots", None) or "")
+    if roots:
+        pieces: List[CanvasSceneDataset] = []
+        for root_s in roots:
+            root_p = Path(root_s).expanduser().resolve()
+            paths = resolve_canvas_data_paths(root_p)
+            if not paths["csv"].is_file():
+                raise FileNotFoundError(
+                    f"canvas_data_roots entry {root_p}: expected CSV at {paths['csv']}"
+                )
+            pieces.append(
+                CanvasSceneDataset(
+                    str(paths["csv"]),
+                    args,
+                    canvas_column=args.canvas_column,
+                    target_column=getattr(args, "canvas_target_column", "image_path"),
+                    prompt_column=getattr(args, "canvas_prompt_column", "prompt"),
+                    asset_image_root=str(paths["images"]),
+                    asset_depth_root=str(paths["depth"]),
+                    asset_caption_root=str(paths["captions"]),
+                    asset_multiview_root=str(paths["multiview"]),
+                )
+            )
+        if len(pieces) == 1:
+            return pieces[0]
+        return CanvasConcatDataset(pieces)
+
+    return CanvasSceneDataset(
         args.csv_path,
         args,
         canvas_column=args.canvas_column,
         target_column=getattr(args, "canvas_target_column", "image_path"),
         prompt_column=getattr(args, "canvas_prompt_column", "prompt"),
     )
-    return ds
 
 
 def collate_fn_canvas(examples: List[Dict[str, Any]]):
